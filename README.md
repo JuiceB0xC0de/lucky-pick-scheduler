@@ -1,74 +1,240 @@
-# Lucky Pick Scheduler + BoL Scans
+# lucky-pick-scheduler
 
-`lucky-pick-scheduler` now includes:
-- A generic, auto-configuring `DeepChaosScheduler` (sticky topology lottery, default sticky interval `50`)
-- BoL scan logging utilities (`bol_scans.run_all`)
+A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre/post training neural network diagnostic suite (BoL scans) that logs structured results to Weights & Biases.
 
-## Installation
+## Install
 
 ```bash
 pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
 ```
 
-## Deep Chaos Scheduler (Auto-Config)
+Dependencies: `torch`, `transformers`, `wandb`. Optional: `peft` (required for quantized models), `scipy` (used in silhouette scan), `muon` (optional optimizer).
 
-The scheduler introspects the currently loaded model and auto-detects:
-- transformer layer stack
-- attention projections (`q/k/v/o`) when present
-- MLP projections (`gate/up/down` or `fc1/fc2` style when present)
+---
 
-It then runs sticky-block topology shuffles that activate only subsets of layers/components/hidden dims.
+## How the Scheduler Works
+
+`DeepChaosScheduler` runs a **sticky-block topology lottery** across your model's transformer layers on every training step.
+
+On each reshuffle (every `sticky_interval` steps), the scheduler:
+
+1. Walks the model and auto-detects the transformer layer stack — no config files required
+2. Marks the first two and last two layers as **sacred** (always active), everything in between is a **victim**
+3. Randomly decides how many victim layers are active this block (30–70% by default)
+4. Enforces streak limits — a layer can't stay dead more than `max_consecutive_off` blocks or stay on more than `max_consecutive_on` blocks in a row
+5. For each active layer, draws a mode: `both` (attn + MLP), `attn only`, `mlp only`, or `identity`
+6. Within each active layer, randomly drops groups of Q/K/V heads, MLP gate/up/down channels, and hidden-dim slices using `register_forward_hook` — the base model's forward pass runs completely untouched
+7. Holds that topology frozen for the next `sticky_interval` steps, then reshuffles
+
+The result is that the model never trains through the same compute path twice for long. It can't over-rely on specific heads or MLP channels and has to build more distributed representations to stay consistent.
+
+### Hook-based, not forward-replacement
+
+The scheduler installs `register_forward_hook` on individual projection modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). The base model's own forward — including its LayerNorms, RoPE, causal masking, sliding window, and any remote-code logic — runs exactly as written. The hooks only zero out non-surviving output indices after each projection fires.
+
+This means it works across model families (Llama, Gemma, Mistral, Qwen, Falcon, GPT-NeoX, etc.) without architecture-specific code.
+
+### Auto-detection
+
+On init, `DeepChaosScheduler` walks the model to find the decoder layer stack. It checks a list of known paths (`model.layers`, `transformer.h`, `gpt_neox.layers`, etc.) and falls back to scoring every `ModuleList` by how much it looks like a transformer block. Hidden size, head count, KV head count, intermediate size, and GQA ratio are all inferred from projection weight shapes.
+
+Sacred and victim ranges are computed from `num_hidden_layers`. If the model has a `layer_types` attribute (Gemma-3, some Falcon variants), global-attention layers are automatically added to the sacred set.
+
+---
+
+## DeepChaosScheduler Usage
+
+### Minimal
 
 ```python
 from lucky_pick_scheduler import DeepChaosScheduler, DeepChaosConfig
 
-# model already loaded (HF/Unsloth/etc)
+# model is already loaded (Unsloth, HF, PEFT, anything)
 dc = DeepChaosScheduler(
     model,
-    DeepChaosConfig(
-        sticky_interval=50,  # sticky-50 behavior
-        seed=42,
-        # sacred_layers / victim_range are optional; auto-inferred by default
-    ),
+    DeepChaosConfig(sticky_interval=50, seed=42),
 )
 
-# each train step:
+# call once per training step
 stats = dc.step(global_step)
 
-# optional hard freeze at a specific step for probes:
-dc.freeze_topology(global_step)
-
-# cleanup at the end
+# when you're done
 dc.remove()
 ```
 
-`stats` includes mode mix, layer density, survival percentages, and compute ratio estimates.
-It also includes `reshuffle_event` (`1.0` on sticky-boundary reshuffle steps, else `0.0`) and emits
-`DeepChaos reshuffle: step=...` console logs when `announce_reshuffles=True` (default).
+`stats` is a dict with keys like `layer_density_pct`, `avg_q_surv`, `avg_gate_surv`, `compute_pct`, `reshuffle_event`, and mode counts. Pass it straight to `wandb.log()` if you want.
 
-### Remote-Code Compatibility Patch
-
-For some custom Hub models (for example certain Doge/Mistral remote-code revisions),
-you may need compatibility shims for changes across `transformers` versions:
+### Config reference
 
 ```python
-from lucky_pick_scheduler import apply_transformers_remote_code_compat
+DeepChaosConfig(
+    sticky_interval=50,         # steps between topology reshuffles
+    seed=42,
 
-apply_transformers_remote_code_compat(verbose=True)
+    # layer survival bounds (fraction of victim layers active per block)
+    min_layer_survival=0.30,
+    max_layer_survival=0.70,
+
+    # attention head survival
+    min_head_survival=0.30,
+    max_head_survival=0.70,
+
+    # MLP channel group survival
+    min_channel_survival=0.30,
+    max_channel_survival=0.70,
+    channel_group_size=128,
+
+    # MLP gate sub-sampling
+    min_mlp_gate_survival=0.35,
+    max_mlp_gate_survival=0.80,
+    mlp_gate_group_size=128,
+
+    # hidden-dim output survival
+    min_hidden_survival=0.60,
+    max_hidden_survival=0.95,
+    hidden_group_size=64,
+
+    # streak limits
+    max_consecutive_on=5,
+    max_consecutive_off=10,
+
+    # override auto-detected ranges if needed
+    sacred_layers=None,         # e.g. [0, 1, 30, 31] for a 32-layer model
+    victim_range=None,          # e.g. (2, 30) — end-exclusive
+
+    announce_reshuffles=True,   # prints a line on each reshuffle
+)
 ```
 
-This patches known runtime mismatches (`OutputRecorder`, `check_model_inputs`,
-and tied-weight key expansion list/dict compatibility) before model loading.
+### Manual sacred/victim override
 
-### Quantized/BitNet Auto-LoRA Prep
+```python
+dc = DeepChaosScheduler(
+    model,
+    DeepChaosConfig(
+        sacred_layers=[0, 1, 31],   # always-on layers
+        victim_range=(2, 31),        # candidates for chaos — end-exclusive
+    ),
+)
+```
 
-For broad model support (including quantized/BitNet checkpoints), you can let the
-package auto-attach LoRA adapters when needed:
+### freeze_topology
+
+If you need to lock the current topology in place (for a probe or eval mid-run):
+
+```python
+dc.freeze_topology(global_step)
+```
+
+---
+
+## Using with Unsloth
+
+The scheduler works with Unsloth's `FastLanguageModel` — load your model normally, wrap it in the scheduler, then call `dc.step()` in a custom training loop or via a `TrainerCallback`.
+
+### Option 1 — Custom training loop
+
+```python
+from unsloth import FastLanguageModel
+from lucky_pick_scheduler import DeepChaosScheduler, DeepChaosConfig
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "unsloth/llama-3.2-3b-instruct",
+    max_seq_length=2048,
+    load_in_4bit=True,
+)
+
+model = FastLanguageModel.get_peft_model(
+    model,
+    r=16,
+    target_modules=["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"],
+    lora_alpha=16,
+    lora_dropout=0.05,
+    bias="none",
+)
+
+from lucky_pick_scheduler import resolve_scheduler_model
+dc = DeepChaosScheduler(
+    resolve_scheduler_model(model),   # unwraps PEFT wrapper for hook installation
+    DeepChaosConfig(sticky_interval=50),
+)
+
+# in your training loop:
+for step, batch in enumerate(dataloader):
+    stats = dc.step(step)
+    loss = model(**batch).loss
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+
+dc.remove()
+```
+
+`resolve_scheduler_model` unwraps PEFT/Unsloth wrappers so the hooks land on the actual transformer modules.
+
+### Option 2 — SFTTrainer via callback
+
+```python
+from unsloth import FastLanguageModel
+from lucky_pick_scheduler import DeepChaosScheduler, DeepChaosConfig, resolve_scheduler_model
+from trl import SFTTrainer, SFTConfig
+from transformers import TrainerCallback
+
+model, tokenizer = FastLanguageModel.from_pretrained(
+    "unsloth/llama-3.2-3b-instruct",
+    max_seq_length=2048,
+    load_in_4bit=True,
+)
+model = FastLanguageModel.get_peft_model(model, r=16, ...)
+
+dc = DeepChaosScheduler(
+    resolve_scheduler_model(model),
+    DeepChaosConfig(sticky_interval=50),
+)
+
+class ChaosStepCallback(TrainerCallback):
+    def __init__(self, scheduler):
+        self.scheduler = scheduler
+
+    def on_step_begin(self, args, state, control, **kwargs):
+        self.scheduler.step(state.global_step)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        self.scheduler.remove()
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    args=SFTConfig(
+        output_dir="./output",
+        per_device_train_batch_size=2,
+        gradient_accumulation_steps=4,
+        num_train_epochs=3,
+        learning_rate=2e-4,
+        fp16=True,
+    ),
+    callbacks=[ChaosStepCallback(dc)],
+)
+trainer.train()
+```
+
+> **Note on gradient checkpointing:** if you use `gradient_checkpointing=True`, keep `sticky_interval >= gradient_accumulation_steps`. If the topology reshuffles in the middle of a gradient accumulation window, the recomputed forward during the backward pass sees a different topology than the original forward, which produces incorrect gradients.
+
+### Using with Axolotl or any other trainer
+
+The pattern is the same — load your model, initialize `DeepChaosScheduler`, plug in a callback or hook that calls `dc.step(global_step)` before each forward pass. The scheduler doesn't care how the model was loaded or what trainer wraps it.
+
+---
+
+## Quantized / BitNet models
+
+If your checkpoint is quantized and the trainer rejects full-parameter training, `prepare_model_for_training` auto-attaches LoRA adapters:
 
 ```python
 from lucky_pick_scheduler import ModelPrepConfig, prepare_model_for_training, resolve_scheduler_model
 
-model, prep = prepare_model_for_training(
+model, prep_report = prepare_model_for_training(
     model,
     ModelPrepConfig(
         auto_lora_for_quantized=True,
@@ -77,47 +243,152 @@ model, prep = prepare_model_for_training(
         lora_dropout=0.05,
     ),
 )
-print(prep.to_dict())
+print(prep_report.to_dict())
 
-# Use base model for scheduler hooks if model was wrapped (PEFT, etc).
-scheduler_model = resolve_scheduler_model(model)
+dc = DeepChaosScheduler(resolve_scheduler_model(model), DeepChaosConfig())
 ```
 
-This keeps full fine-tuning for non-quantized checkpoints and switches to adapter
-training automatically when Trainer rejects pure quantized full-parameter training.
+For non-quantized models, `prepare_model_for_training` is a no-op.
 
-## BoL Scans Usage
+---
 
-Drop this into Unsloth, TRL, HuggingFace Trainer, or any raw training loop:
+## Remote-code model compatibility
+
+Some Hub models (certain Doge/Mistral remote-code revisions) have runtime mismatches across `transformers` versions. Apply the compatibility patch before loading:
+
+```python
+from lucky_pick_scheduler import apply_transformers_remote_code_compat
+
+apply_transformers_remote_code_compat(verbose=True)
+
+# then load your model as usual
+```
+
+---
+
+## Auto optimizer + LR scheduler
+
+`build_scheduler_stack` introspects the model, groups parameters by role (attention, MLP, embedding, head, norm/bias), and builds an optimizer + LR scheduler automatically. It prefers Muon for attention and MLP matrices and falls back to AdamW if Muon isn't installed.
+
+```python
+from lucky_pick_scheduler import build_scheduler_stack, AutoSchedulerConfig
+
+optimizer, lr_scheduler, report = build_scheduler_stack(
+    model,
+    num_training_steps=1000,
+    config=AutoSchedulerConfig(
+        learning_rate=2e-5,
+        weight_decay=0.01,
+        lr_scheduler_type="cosine",
+        warmup_ratio=0.1,
+        prefer_muon=True,
+    ),
+)
+print(report.to_dict())
+```
+
+---
+
+## BoL Scans
+
+BoL (Blocks of Life) is the diagnostic suite. It runs six scans against a loaded model and tokenizer and logs everything to your active W&B run. The point is to snapshot the model before and after training so you can see concretely what changed.
+
+### Usage
 
 ```python
 import wandb
 from bol_scans import run_all
 
-# Initialize your model and tokenizer...
+wandb.init(project="my-project", name="run-name")
 
-# 1. Start W&B
-wandb.init(project="my-project", name="bella-v6-eval")
-
-# 2. Run scans before training
+# before training
 run_all(model, tokenizer, phase="pre")
 
-# 3. Train as usual
 trainer.train()
 
-# 4. Run scans after training
+# after training
 run_all(model, tokenizer, phase="post")
 ```
 
-`run_all(...)`:
-- Uses the model and tokenizer you already loaded
-- Detects architecture from `model.config` (and model structure fallback)
-- Runs all 6 scans:
-  - weight fingerprint
-  - layer sweep
-- component ablation
-- silhouette
-- CKA
-- attention map
-- Adds component-aware fingerprint panels (`q/k/v/o`, `gate/up/down`) and per-layer dimension profile tables
-- Logs metrics/tables/charts to active `wandb.run` using `pre/*` or `post/*` key prefixes
+All metrics are logged under `pre/*` and `post/*` key prefixes in W&B.
+
+### The six scans
+
+**Weight Fingerprint**
+Per-layer, per-component weight statistics: mean, std, L2 norm, sparsity, and kurtosis for every projection group (q/k/v/o, gate/up/down). Gives you a direct before/after diff of what the optimizer actually changed and by how much in each part of the network.
+
+**Layer Sweep**
+Progressively zeroes out each layer from the top down and measures how much generation output changes. Shows which layers carry the most load and which the model is barely using.
+
+**Component Ablation**
+Zeroes out one projection type at a time (all Q projections, all V projections, all gate projections, etc.) across the full model and measures the perplexity hit. Shows relative importance of each projection family.
+
+**Silhouette**
+Extracts hidden-state representations for semantically related and unrelated word pairs, then computes a silhouette score measuring how well the model separates them in representation space. A score closer to 1.0 means tighter clustering of related concepts; a score near 0 means the representations are poorly separated.
+
+**CKA (Centered Kernel Alignment)**
+Computes pairwise representational similarity between every layer combination using a fixed set of semantic probe words. Produces a heatmap showing which layers have converged to similar representations and which are doing meaningfully different things.
+
+**Attention Map**
+Measures per-head attention entropy and cross-token similarity for each layer. Low entropy heads are attending sharply to specific tokens; high entropy heads are diffuse. Also measures consistency of attention patterns across similar inputs.
+
+### Custom eval texts and probes
+
+All six scans accept custom inputs:
+
+```python
+run_all(
+    model,
+    tokenizer,
+    phase="pre",
+    eval_texts=["your text here", "another example"],
+    probes=["The capital of France is", "def fibonacci(n):"],
+    related_pairs=[("dog", "wolf"), ("happy", "joyful")],
+    unrelated_pairs=[("dog", "democracy"), ("happy", "concrete")],
+    cluster_words=["dog", "wolf", "car", "truck", "happy", "joy"],
+    clusters={
+        "animals": ["dog", "wolf"],
+        "vehicles": ["car", "truck"],
+        "emotions": ["happy", "joy"],
+    },
+    layer_stride=2,   # skip every other layer for faster CKA on large models
+)
+```
+
+### TrainerCallback (HuggingFace / Unsloth / TRL)
+
+`BoLWandbCallback` in `bol_wandb` handles the pre/post timing automatically:
+
+```python
+from bol_wandb import BoLWandbCallback
+
+trainer = SFTTrainer(
+    model=model,
+    tokenizer=tokenizer,
+    train_dataset=dataset,
+    args=training_args,
+    callbacks=[BoLWandbCallback(model, tokenizer)],
+)
+trainer.train()
+```
+
+The callback fires `run_all(..., phase="pre")` on `on_train_begin` and `run_all(..., phase="post")` on `on_train_end`. W&B must be initialized before the trainer starts.
+
+---
+
+## File layout
+
+```
+lucky-pick-scheduler/
+├── lucky_pick_scheduler/
+│   ├── __init__.py
+│   ├── deep_chaos.py       # DeepChaosScheduler, DeepChaosConfig, LayerBindings, topology logic
+│   ├── scheduler.py        # build_scheduler_stack, AutoSchedulerConfig, parameter role classification
+│   ├── model_prep.py       # prepare_model_for_training, auto-LoRA for quantized checkpoints
+│   └── compat.py           # apply_transformers_remote_code_compat
+├── bol_wandb/
+│   ├── callback.py         # BoLWandbCallback (TrainerCallback)
+│   └── config.py           # shared eval text and probe defaults
+├── bol_scans.py            # run_all() — the six scans + W&B logging
+└── setup.py
+```
