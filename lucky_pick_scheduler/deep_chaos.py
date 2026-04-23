@@ -149,6 +149,7 @@ class DeepChaosConfig:
     max_consecutive_on: int = 5
     max_consecutive_off: int = 10
     sticky_interval: int = 50
+    announce_reshuffles: bool = True
     seed: int = 42
 
 
@@ -391,7 +392,9 @@ class DeepChaosScheduler:
             and self.last_shuffle_step is not None
             and global_step < self.last_shuffle_step + max(1, int(self.config.sticky_interval))
         ):
-            return self.cached_stats
+            cached = dict(self.cached_stats)
+            cached["reshuffle_event"] = 0.0
+            return cached
 
         self.last_shuffle_step = int(global_step)
         block_idx = int(global_step) // max(1, int(self.config.sticky_interval))
@@ -520,6 +523,7 @@ class DeepChaosScheduler:
         self.cached_stats = {
             "shuffle_step": float(global_step),
             "shuffle_block": float(block_idx),
+            "reshuffle_event": 1.0,
             "active_layers": float(active_count),
             "layer_density_pct": 100.0 * float(active_count) / float(max(1, num_victims)),
             "mode_both": float(mode_counts["both"]),
@@ -537,6 +541,15 @@ class DeepChaosScheduler:
             "compute_ratio": compute_ratio,
             "compute_pct": 100.0 * compute_ratio,
         }
+        if bool(self.config.announce_reshuffles):
+            print(
+                "DeepChaos reshuffle: "
+                f"step={global_step} block={block_idx} "
+                f"active={active_count}/{max(1, num_victims)} "
+                f"modes(both/attn/mlp/id/dead)="
+                f"{mode_counts['both']}/{mode_counts['attn']}/{mode_counts['mlp']}/"
+                f"{mode_counts['identity']}/{mode_counts['dead']}"
+            )
         return self.cached_stats
 
     def freeze_topology(self, step: int):

@@ -43,6 +43,8 @@ dc.remove()
 ```
 
 `stats` includes mode mix, layer density, survival percentages, and compute ratio estimates.
+It also includes `reshuffle_event` (`1.0` on sticky-boundary reshuffle steps, else `0.0`) and emits
+`DeepChaos reshuffle: step=...` console logs when `announce_reshuffles=True` (default).
 
 ### Remote-Code Compatibility Patch
 
