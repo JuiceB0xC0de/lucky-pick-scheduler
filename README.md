@@ -229,6 +229,8 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 
 ## Quantized / BitNet models
 
+### BitsAndBytes / GPTQ / AWQ (standard quantized)
+
 If your checkpoint is quantized and the trainer rejects full-parameter training, `prepare_model_for_training` auto-attaches LoRA adapters:
 
 ```python
@@ -241,9 +243,6 @@ model, prep_report = prepare_model_for_training(
         lora_r=16,
         lora_alpha=32,
         lora_dropout=0.05,
-        # optional fallbacks for quantized wrappers (e.g. BitLinear):
-        # try_dequantize_if_available=True,
-        # allow_trainer_quantization_bypass=True,
     ),
 )
 print(prep_report.to_dict())
@@ -252,11 +251,61 @@ dc = DeepChaosScheduler(resolve_scheduler_model(model), DeepChaosConfig())
 ```
 
 For non-quantized models, `prepare_model_for_training` is a no-op.
-For quantized checkpoints, it first tries LoRA injection on PEFT-supported module
-types, then can optionally try dequantization, and finally can apply an explicit
-Trainer quantization-validation bypass as a last-resort compatibility path,
-including clearing common quantization guard flags that some Trainer versions
-use for inline validation.
+
+### Falcon-E and BitNet series (ternary weights)
+
+`tiiuae/Falcon-E-3B-Instruct` (and `Falcon-E-1B-Base`, `Falcon-E-7B-Base`, Microsoft's BitNet series) have three revisions:
+
+| Revision | Use case |
+|---|---|
+| default | Inference only — packed ternary weights. `transformers` blocks training on this. |
+| `prequantized` | Fine-tuning — bfloat16 weights, compatible with `onebitllms`. |
+| `bfloat16` | bfloat16 inference without BitNet kernels. |
+
+If you load the default revision and call any trainer, you'll get:
+
+```
+ValueError: The model you are trying to fine-tune is quantized with QuantizationMethod.BITNET
+but that quantization method do not support training.
+```
+
+The correct path:
+
+```python
+import torch
+from transformers import AutoModelForCausalLM, AutoTokenizer
+from lucky_pick_scheduler import apply_bitnet_linear_replacement, DeepChaosScheduler, DeepChaosConfig
+
+model_id = "tiiuae/Falcon-E-3B-Instruct"  # or Falcon-E-1B-Base, Falcon-E-7B-Base, etc.
+
+tokenizer = AutoTokenizer.from_pretrained(model_id, revision="prequantized")
+model = AutoModelForCausalLM.from_pretrained(
+    model_id,
+    revision="prequantized",
+    torch_dtype=torch.bfloat16,
+    device_map="auto",
+)
+
+# Replace standard linears with trainable BitLinear layers (onebitllms QAT).
+# This also auto-patches transformers' training validator so the Trainer
+# doesn't reject the model — no extra steps needed.
+model = apply_bitnet_linear_replacement(model)
+
+dc = DeepChaosScheduler(model, DeepChaosConfig(sticky_interval=50))
+
+# then set up your trainer as normal...
+```
+
+After training, convert the checkpoint back to packed ternary for deployment:
+
+```python
+from onebitllms import quantize_to_1bit
+quantize_to_1bit(output_dir, quantized_output_dir)
+```
+
+Requires `pip install onebitllms`. LoRA/PEFT is not currently supported for BitNet models — `apply_bitnet_linear_replacement` does full-parameter QAT using a straight-through estimator.
+
+> **Container/Modal note:** `pip install git+https://...` in a container image is cached at build time. If you push changes to this repo and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git`
 
 ---
 
