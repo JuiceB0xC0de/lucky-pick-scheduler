@@ -108,6 +108,23 @@ def allow_quantized_training_in_trainer(*, verbose: bool = True) -> List[str]:
             setattr(module, "validate_quantization_for_training", _noop_validate_quantization_for_training)
             applied.append(f"{module_name}.validate_quantization_for_training")
 
+    # Some Transformers builds bind validate_quantization_for_training into
+    # Trainer.__init__.__globals__ at import time; patch that binding too.
+    try:
+        trainer_mod = importlib.import_module("transformers.trainer")
+        trainer_cls = getattr(trainer_mod, "Trainer", None)
+        trainer_init = getattr(trainer_cls, "__init__", None)
+        init_globals = getattr(trainer_init, "__globals__", None)
+        if isinstance(init_globals, dict) and "validate_quantization_for_training" in init_globals:
+            if init_globals.get("validate_quantization_for_training") is not _noop_validate_quantization_for_training:
+                init_globals["_lps_orig_validate_quantization_for_training"] = init_globals[
+                    "validate_quantization_for_training"
+                ]
+                init_globals["validate_quantization_for_training"] = _noop_validate_quantization_for_training
+                applied.append("transformers.trainer.Trainer.__init__.__globals__.validate_quantization_for_training")
+    except Exception:
+        pass
+
     if verbose and applied:
         print(f"[lucky_pick_scheduler.compat] Applied patches: {', '.join(applied)}")
     return applied
