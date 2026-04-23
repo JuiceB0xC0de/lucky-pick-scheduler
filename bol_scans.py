@@ -113,6 +113,19 @@ COMPONENT_PRIORITY = [
     "mlp.down_proj",
 ]
 
+COMPONENT_DISPLAY_ORDER = [
+    "q_proj",
+    "k_proj",
+    "v_proj",
+    "o_proj",
+    "gate_proj",
+    "up_proj",
+    "down_proj",
+    "attn_other",
+    "mlp_other",
+    "other",
+]
+
 
 def _component_label(param_name: str) -> str:
     if "self_attn.q_proj" in param_name:
@@ -142,6 +155,38 @@ def _component_family(component: str) -> str:
     if component in {"gate_proj", "up_proj", "down_proj", "mlp_other"}:
         return "mlp"
     return "other"
+
+
+def _component_rank(component: str) -> int:
+    try:
+        return COMPONENT_DISPLAY_ORDER.index(component)
+    except ValueError:
+        return len(COMPONENT_DISPLAY_ORDER)
+
+
+def _fmt_dim(value: Any) -> str:
+    if value is None:
+        return "?"
+    try:
+        return str(int(value))
+    except Exception:
+        return str(value)
+
+
+def _layer_label(layer_idx: int, width: int) -> str:
+    return f"L{layer_idx:0{width}d}"
+
+
+def _transformer_block_label(layer_idx: int, width: int, dims: Dict[str, Any]) -> str:
+    label = _layer_label(layer_idx, width)
+    hidden = _fmt_dim(dims.get("hidden_dim"))
+    q_out = _fmt_dim(dims.get("attn_q_out_dim"))
+    k_out = _fmt_dim(dims.get("attn_k_out_dim"))
+    v_out = _fmt_dim(dims.get("attn_v_out_dim"))
+    o_in = _fmt_dim(dims.get("attn_o_in_dim"))
+    mlp_mid = _fmt_dim(dims.get("mlp_intermediate_dim"))
+    mlp_down = _fmt_dim(dims.get("mlp_down_in_dim"))
+    return f"{label} h{hidden} attn({q_out}/{k_out}/{v_out}->{o_in}) mlp({mlp_mid}->{mlp_down})"
 
 
 def _pad_token_id(tokenizer) -> int | None:
@@ -322,6 +367,9 @@ def _compute_weight_fingerprint(
     layers: Sequence[Tuple[int, str, torch.nn.Module]],
 ) -> Dict[str, Any]:
     rows: List[Dict[str, Any]] = []
+    layer_name_by_idx: Dict[int, str] = {idx: name for idx, name, _ in layers}
+    layer_indices = sorted(layer_name_by_idx.keys())
+    layer_label_width = max(2, len(str(layer_indices[-1]))) if layer_indices else 2
     layer_abs_means: Dict[int, List[float]] = {}
     layer_stds: Dict[int, List[float]] = {}
     layer_sparsity: Dict[int, List[float]] = {}
@@ -355,6 +403,8 @@ def _compute_weight_fingerprint(
             data = param.detach().float()
             stats: Dict[str, Any] = {
                 "layer": layer_idx,
+                "layer_name": layer_name,
+                "layer_label": _layer_label(layer_idx, layer_label_width),
                 "name": full_name,
                 "component": component,
                 "family": _component_family(component),
@@ -405,32 +455,8 @@ def _compute_weight_fingerprint(
             elif local_name.endswith("mlp.down_proj.weight"):
                 info["mlp_down_in_dim"] = int(param.shape[1])
 
-    layer_summary = []
-    for layer_idx in sorted(layer_abs_means):
-        layer_summary.append(
-            {
-                "layer": layer_idx,
-                "abs_mean": float(np.mean(layer_abs_means[layer_idx])),
-                "std": float(np.mean(layer_stds[layer_idx])),
-                "sparsity": float(np.mean(layer_sparsity[layer_idx])),
-            }
-        )
-
-    layer_component_summary = []
-    for (layer_idx, component), values in sorted(component_abs_means.items(), key=lambda x: (x[0][0], x[0][1])):
-        layer_component_summary.append(
-            {
-                "layer": layer_idx,
-                "component": component,
-                "family": _component_family(component),
-                "abs_mean": float(np.mean(values)),
-                "std": float(np.mean(component_stds[(layer_idx, component)])),
-                "sparsity": float(np.mean(component_sparsity[(layer_idx, component)])),
-                "tensor_count": int(component_counts[(layer_idx, component)]),
-            }
-        )
-
     layer_dimension_summary = []
+    layer_dims_by_idx: Dict[int, Dict[str, Any]] = {}
     for layer_idx in sorted(layer_input_dims.keys()):
         info = _layer_info(layer_idx)
         if info["hidden_dim"] is None and layer_input_dims[layer_idx]:
@@ -451,18 +477,74 @@ def _compute_weight_fingerprint(
                 effective_nonzero = int(np.sum(combined > 0.0))
                 effective_1pct = int(np.sum(combined > (0.01 * max_energy))) if max_energy > 0 else 0
 
-        layer_dimension_summary.append(
+        dims_row = {
+            "layer": layer_idx,
+            "layer_name": layer_name_by_idx.get(layer_idx, f"layer.{layer_idx}"),
+            "layer_label": _layer_label(layer_idx, layer_label_width),
+            "hidden_dim": hidden_dim,
+            "effective_hidden_dims_nonzero": effective_nonzero,
+            "effective_hidden_dims_1pct": effective_1pct,
+            "attn_q_out_dim": info["attn_q_out_dim"],
+            "attn_k_out_dim": info["attn_k_out_dim"],
+            "attn_v_out_dim": info["attn_v_out_dim"],
+            "attn_o_in_dim": info["attn_o_in_dim"],
+            "mlp_intermediate_dim": info["mlp_intermediate_dim"],
+            "mlp_down_in_dim": info["mlp_down_in_dim"],
+        }
+        dims_row["transformer_block"] = _transformer_block_label(layer_idx, layer_label_width, dims_row)
+        layer_dimension_summary.append(dims_row)
+        layer_dims_by_idx[layer_idx] = dims_row
+
+    layer_summary = []
+    for layer_idx in sorted(layer_abs_means):
+        dims_row = layer_dims_by_idx.get(
+            layer_idx,
+            {
+                "hidden_dim": None,
+                "attn_q_out_dim": None,
+                "attn_k_out_dim": None,
+                "attn_v_out_dim": None,
+                "attn_o_in_dim": None,
+                "mlp_intermediate_dim": None,
+                "mlp_down_in_dim": None,
+            },
+        )
+        layer_summary.append(
             {
                 "layer": layer_idx,
-                "hidden_dim": hidden_dim,
-                "effective_hidden_dims_nonzero": effective_nonzero,
-                "effective_hidden_dims_1pct": effective_1pct,
-                "attn_q_out_dim": info["attn_q_out_dim"],
-                "attn_k_out_dim": info["attn_k_out_dim"],
-                "attn_v_out_dim": info["attn_v_out_dim"],
-                "attn_o_in_dim": info["attn_o_in_dim"],
-                "mlp_intermediate_dim": info["mlp_intermediate_dim"],
-                "mlp_down_in_dim": info["mlp_down_in_dim"],
+                "layer_name": layer_name_by_idx.get(layer_idx, f"layer.{layer_idx}"),
+                "layer_label": _layer_label(layer_idx, layer_label_width),
+                "transformer_block": _transformer_block_label(layer_idx, layer_label_width, dims_row),
+                "abs_mean": float(np.mean(layer_abs_means[layer_idx])),
+                "std": float(np.mean(layer_stds[layer_idx])),
+                "sparsity": float(np.mean(layer_sparsity[layer_idx])),
+            }
+        )
+
+    layer_component_summary = []
+    for (layer_idx, component), values in sorted(
+        component_abs_means.items(), key=lambda x: (x[0][0], _component_rank(x[0][1]), x[0][1])
+    ):
+        layer_label = _layer_label(layer_idx, layer_label_width)
+        component_rank = _component_rank(component)
+        layer_component_summary.append(
+            {
+                "layer": layer_idx,
+                "layer_name": layer_name_by_idx.get(layer_idx, f"layer.{layer_idx}"),
+                "layer_label": layer_label,
+                "layer_component": f"{layer_label}.{component}",
+                "transformer_block": _transformer_block_label(
+                    layer_idx, layer_label_width, layer_dims_by_idx.get(layer_idx, {})
+                ),
+                "component": component,
+                "component_rank": component_rank,
+                "component_ordered": f"{component_rank:02d}_{component}",
+                "component_display": f"{component_rank + 1}. {component}",
+                "family": _component_family(component),
+                "abs_mean": float(np.mean(values)),
+                "std": float(np.mean(component_stds[(layer_idx, component)])),
+                "sparsity": float(np.mean(component_sparsity[(layer_idx, component)])),
+                "tensor_count": int(component_counts[(layer_idx, component)]),
             }
         )
 
@@ -1053,10 +1135,25 @@ def run_all(
     if "weight_fingerprint" in results:
         fp = results["weight_fingerprint"]
         fp_table = wandb.Table(
-            columns=["layer", "name", "component", "family", "mean", "std", "abs_mean", "sparsity", "frobenius", "spectral_norm"],
+            columns=[
+                "layer",
+                "layer_label",
+                "layer_name",
+                "name",
+                "component",
+                "family",
+                "mean",
+                "std",
+                "abs_mean",
+                "sparsity",
+                "frobenius",
+                "spectral_norm",
+            ],
             data=[
                 [
                     row["layer"],
+                    row["layer_label"],
+                    row["layer_name"],
                     row["name"],
                     row["component"],
                     row["family"],
@@ -1071,18 +1168,48 @@ def run_all(
             ],
         )
         fp_layer_table = wandb.Table(
-            columns=["layer", "abs_mean", "std", "sparsity"],
+            columns=["layer", "layer_label", "layer_name", "transformer_block", "abs_mean", "std", "sparsity"],
             data=[
-                [row["layer"], row["abs_mean"], row["std"], row["sparsity"]]
+                [
+                    row["layer"],
+                    row["layer_label"],
+                    row["layer_name"],
+                    row["transformer_block"],
+                    row["abs_mean"],
+                    row["std"],
+                    row["sparsity"],
+                ]
                 for row in fp["layer_summary"]
             ],
         )
         fp_component_table = wandb.Table(
-            columns=["layer", "component", "family", "abs_mean", "std", "sparsity", "tensor_count"],
+            columns=[
+                "layer",
+                "layer_label",
+                "layer_name",
+                "layer_component",
+                "transformer_block",
+                "component",
+                "component_rank",
+                "component_ordered",
+                "component_display",
+                "family",
+                "abs_mean",
+                "std",
+                "sparsity",
+                "tensor_count",
+            ],
             data=[
                 [
                     row["layer"],
+                    row["layer_label"],
+                    row["layer_name"],
+                    row["layer_component"],
+                    row["transformer_block"],
                     row["component"],
+                    row["component_rank"],
+                    row["component_ordered"],
+                    row["component_display"],
                     row["family"],
                     row["abs_mean"],
                     row["std"],
@@ -1095,6 +1222,9 @@ def run_all(
         fp_dim_table = wandb.Table(
             columns=[
                 "layer",
+                "layer_label",
+                "layer_name",
+                "transformer_block",
                 "hidden_dim",
                 "effective_hidden_dims_nonzero",
                 "effective_hidden_dims_1pct",
@@ -1108,6 +1238,9 @@ def run_all(
             data=[
                 [
                     row["layer"],
+                    row["layer_label"],
+                    row["layer_name"],
+                    row["transformer_block"],
                     row["hidden_dim"],
                     row["effective_hidden_dims_nonzero"],
                     row["effective_hidden_dims_1pct"],
@@ -1133,10 +1266,21 @@ def run_all(
         line_plot = _try_plot_line(fp_layer_table, "layer", "std", "Fingerprint Std by Layer")
         if line_plot is not None:
             log_payload[f"{prefix}fingerprint/std_curve"] = line_plot
+        labeled_line_plot = _try_plot_line(fp_layer_table, "layer_label", "std", "Fingerprint Std by Layer (Labeled)")
+        if labeled_line_plot is not None:
+            log_payload[f"{prefix}fingerprint/std_curve_labeled"] = labeled_line_plot
+        transformer_std_plot = _try_plot_bar(
+            fp_layer_table,
+            "transformer_block",
+            "std",
+            "Fingerprint Std by Transformer Block",
+        )
+        if transformer_std_plot is not None:
+            log_payload[f"{prefix}fingerprint/std_by_transformer_block"] = transformer_std_plot
         component_std_heatmap = _try_plot_heatmap(
             fp_component_table,
             "layer",
-            "component",
+            "component_display",
             "std",
             "Fingerprint Std by Layer + Component",
         )
@@ -1145,16 +1289,24 @@ def run_all(
         component_abs_heatmap = _try_plot_heatmap(
             fp_component_table,
             "layer",
-            "component",
+            "component_display",
             "abs_mean",
             "Fingerprint Abs Mean by Layer + Component",
         )
         if component_abs_heatmap is not None:
             log_payload[f"{prefix}fingerprint/component_abs_mean_heatmap"] = component_abs_heatmap
+        component_std_bar = _try_plot_bar(
+            fp_component_table,
+            "layer_component",
+            "std",
+            "Fingerprint Std by Transformer Component",
+        )
+        if component_std_bar is not None:
+            log_payload[f"{prefix}fingerprint/component_std_by_layer_component"] = component_std_bar
         effective_dim_table = wandb.Table(
-            columns=["layer", "effective_hidden_dims_1pct"],
+            columns=["layer", "layer_label", "effective_hidden_dims_1pct"],
             data=[
-                [row["layer"], row["effective_hidden_dims_1pct"]]
+                [row["layer"], row["layer_label"], row["effective_hidden_dims_1pct"]]
                 for row in fp["layer_dimension_summary"]
                 if row["effective_hidden_dims_1pct"] is not None
             ],
@@ -1168,6 +1320,14 @@ def run_all(
             )
             if effective_line is not None:
                 log_payload[f"{prefix}fingerprint/effective_hidden_dims_curve"] = effective_line
+            effective_labeled_line = _try_plot_line(
+                effective_dim_table,
+                "layer_label",
+                "effective_hidden_dims_1pct",
+                "Effective Hidden Dims by Layer (Labeled)",
+            )
+            if effective_labeled_line is not None:
+                log_payload[f"{prefix}fingerprint/effective_hidden_dims_curve_labeled"] = effective_labeled_line
 
     if "layer_sweep" in results:
         sweep = results["layer_sweep"]
