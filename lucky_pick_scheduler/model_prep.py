@@ -106,6 +106,29 @@ def resolve_scheduler_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
+def _set_attr_best_effort(obj: object, name: str, value, notes: List[str]):
+    try:
+        setattr(obj, name, value)
+    except Exception as exc:
+        notes.append(f"setattr_failed:{type(obj).__name__}.{name}:{exc}")
+
+
+def _clear_quantization_training_flags(model: torch.nn.Module, notes: List[str]) -> bool:
+    touched = False
+    for obj in (model, resolve_scheduler_model(model)):
+        for name, value in (
+            ("is_quantized", False),
+            ("quantization_method", None),
+            ("hf_quantizer", None),
+        ):
+            before = getattr(obj, name, None)
+            _set_attr_best_effort(obj, name, value, notes)
+            after = getattr(obj, name, None)
+            if before is not after:
+                touched = True
+    return touched
+
+
 def prepare_model_for_training(
     model: torch.nn.Module,
     config: ModelPrepConfig | None = None,
@@ -176,6 +199,9 @@ def prepare_model_for_training(
         trainer_quantization_bypass_applied = len(patched) > 0
         if trainer_quantization_bypass_applied:
             notes.append("trainer_quantization_validation_bypassed")
+        if _clear_quantization_training_flags(model, notes):
+            notes.append("quantization_flags_cleared_for_trainer")
+        quantized = is_quantized_model(model)
 
     report = ModelPrepReport(
         quantized_detected=bool(quantized),

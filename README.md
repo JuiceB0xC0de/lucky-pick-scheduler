@@ -254,7 +254,9 @@ dc = DeepChaosScheduler(resolve_scheduler_model(model), DeepChaosConfig())
 For non-quantized models, `prepare_model_for_training` is a no-op.
 For quantized checkpoints, it first tries LoRA injection on PEFT-supported module
 types, then can optionally try dequantization, and finally can apply an explicit
-Trainer quantization-validation bypass as a last-resort compatibility path.
+Trainer quantization-validation bypass as a last-resort compatibility path,
+including clearing common quantization guard flags that some Trainer versions
+use for inline validation.
 
 ---
 
