@@ -24,20 +24,56 @@ def _get_quantization_method_name(model: torch.nn.Module) -> str | None:
     return name.split(".")[-1]  # e.g. 'BITNET', 'BITS_AND_BYTES', etc.
 
 
+def _is_bitnet_via_config(model: torch.nn.Module) -> bool:
+    """Check model.config for BitNet markers.
+
+    Falcon-E and Microsoft BitNet checkpoints set ``is_bitnet_config = True``
+    in their config.json, and/or set ``quantization_config.quant_method = 'bitnet'``.
+    This is the most reliable early-detection path — it works even before
+    transformers has had a chance to set ``model.quantization_method``.
+    """
+    cfg = getattr(model, "config", None)
+    if cfg is None:
+        return False
+
+    # Direct flag — present in tiiuae/Falcon-E and Microsoft/bitnet series
+    if getattr(cfg, "is_bitnet_config", False):
+        return True
+
+    # quantization_config attribute (PretrainedConfig stores it as an object)
+    qcfg = getattr(cfg, "quantization_config", None)
+    if qcfg is not None:
+        qm = getattr(qcfg, "quant_method", None)
+        if qm is not None and "bitnet" in str(qm).lower():
+            return True
+
+    return False
+
+
 def is_bitnet_model(model: torch.nn.Module) -> bool:
     """Return True if the model is a native BitNet quantized checkpoint.
 
-    This is the case when transformers sets quantization_method = BITNET
-    (i.e. the model was loaded from the packed ternary checkpoint, not the
-    pre-quantized bfloat16 revision).  Training this directly is blocked by
-    transformers' validate_quantization_for_training().
+    Checks three sources in order:
+    1. ``model.quantization_method`` — set by transformers after weight loading.
+    2. ``model.config`` — ``is_bitnet_config`` or ``quantization_config.quant_method``;
+       reliable even before transformers sets the model-level attribute.
+    3. Module scan — looks for ``BitLinear``-named submodules as a last resort.
+
+    A native BitNet checkpoint (packed ternary weights) is NOT directly trainable.
+    transformers blocks it via ``validate_quantization_for_training()``.
+    Load with ``revision='prequantized'`` and call
+    ``apply_bitnet_linear_replacement(model)`` instead.
     """
+    # 1. model-level attribute set by transformers' HfQuantizer
     method = _get_quantization_method_name(model)
     if method is not None and "BITNET" in method:
         return True
 
-    # Fallback: scan for BitLinear layers (class name contains 'bitlinear' or
-    # 'bitnet') — present when loaded via the default revision.
+    # 2. config-level markers — catches early calls and stale installs
+    if _is_bitnet_via_config(model):
+        return True
+
+    # 3. Module scan — BitLinear layers only present in the packed checkpoint
     for _, module in model.named_modules():
         cls = module.__class__.__name__.lower()
         if "bitlinear" in cls or ("bitnet" in cls and "linear" in cls):
@@ -183,13 +219,30 @@ _BITNET_PREQUANTIZED_HINT = """
 """
 
 
-def apply_bitnet_linear_replacement(model: torch.nn.Module, verbose: bool = True) -> torch.nn.Module:
+def apply_bitnet_linear_replacement(
+    model: torch.nn.Module,
+    verbose: bool = True,
+    patch_trainer_validation: bool = True,
+) -> torch.nn.Module:
     """Replace linear layers with trainable BitLinear layers via onebitllms.
 
-    Call this AFTER loading with revision="prequantized" and BEFORE passing
+    Call this AFTER loading with ``revision='prequantized'`` and BEFORE passing
     the model to DeepChaosScheduler or any trainer.
 
-    Raises RuntimeError if onebitllms is not installed.
+    Args:
+        model: Model loaded from the ``prequantized`` revision.
+        verbose: Print a confirmation message after replacement.
+        patch_trainer_validation: When True (default), patches out
+            ``transformers.trainer_utils.validate_quantization_for_training``
+            after replacement.  After ``replace_linear_with_bitnet_linear`` the
+            model is trainable, but transformers still sees
+            ``quantization_method = BITNET`` and blocks the Trainer.  This patch
+            is the same as calling
+            ``lucky_pick_scheduler.compat.allow_quantized_training_in_trainer()``
+            manually.  Set to False if you want to manage the patch yourself.
+
+    Raises:
+        RuntimeError: If ``onebitllms`` is not installed.
     """
     try:
         from onebitllms import replace_linear_with_bitnet_linear  # type: ignore[import]
@@ -202,6 +255,25 @@ def apply_bitnet_linear_replacement(model: torch.nn.Module, verbose: bool = True
     model = replace_linear_with_bitnet_linear(model)
     if verbose:
         print("[lucky_pick_scheduler] BitLinear replacement applied (onebitllms).")
+
+    if patch_trainer_validation:
+        try:
+            from .compat import allow_quantized_training_in_trainer
+            patched = allow_quantized_training_in_trainer(verbose=verbose)
+            if verbose and patched:
+                print(
+                    "[lucky_pick_scheduler] Patched trainer quantization validation "
+                    "(BitNet model is trainable after replace_linear_with_bitnet_linear)."
+                )
+        except Exception as exc:  # pragma: no cover
+            warnings.warn(
+                f"[lucky_pick_scheduler] Could not patch trainer validation: {exc}\n"
+                "Call lucky_pick_scheduler.compat.allow_quantized_training_in_trainer() "
+                "manually before constructing your Trainer.",
+                UserWarning,
+                stacklevel=2,
+            )
+
     return model
 
 
