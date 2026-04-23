@@ -44,6 +44,20 @@ dc.remove()
 
 `stats` includes mode mix, layer density, survival percentages, and compute ratio estimates.
 
+### Remote-Code Compatibility Patch
+
+For some custom Hub models (for example certain Doge/Mistral remote-code revisions),
+you may need compatibility shims for changes across `transformers` versions:
+
+```python
+from lucky_pick_scheduler import apply_transformers_remote_code_compat
+
+apply_transformers_remote_code_compat(verbose=True)
+```
+
+This patches known runtime mismatches (`OutputRecorder`, `check_model_inputs`,
+and tied-weight key expansion list/dict compatibility) before model loading.
+
 ## BoL Scans Usage
 
 Drop this into Unsloth, TRL, HuggingFace Trainer, or any raw training loop:
