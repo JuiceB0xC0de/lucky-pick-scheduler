@@ -60,6 +60,32 @@ apply_transformers_remote_code_compat(verbose=True)
 This patches known runtime mismatches (`OutputRecorder`, `check_model_inputs`,
 and tied-weight key expansion list/dict compatibility) before model loading.
 
+### Quantized/BitNet Auto-LoRA Prep
+
+For broad model support (including quantized/BitNet checkpoints), you can let the
+package auto-attach LoRA adapters when needed:
+
+```python
+from lucky_pick_scheduler import ModelPrepConfig, prepare_model_for_training, resolve_scheduler_model
+
+model, prep = prepare_model_for_training(
+    model,
+    ModelPrepConfig(
+        auto_lora_for_quantized=True,
+        lora_r=16,
+        lora_alpha=32,
+        lora_dropout=0.05,
+    ),
+)
+print(prep.to_dict())
+
+# Use base model for scheduler hooks if model was wrapped (PEFT, etc).
+scheduler_model = resolve_scheduler_model(model)
+```
+
+This keeps full fine-tuning for non-quantized checkpoints and switches to adapter
+training automatically when Trainer rejects pure quantized full-parameter training.
+
 ## BoL Scans Usage
 
 Drop this into Unsloth, TRL, HuggingFace Trainer, or any raw training loop:

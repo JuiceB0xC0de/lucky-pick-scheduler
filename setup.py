@@ -11,6 +11,7 @@ setup(
         "wandb",
         "transformers",
         "torch",
+        "peft",
         "numpy",
         "tqdm",
         "scipy"
