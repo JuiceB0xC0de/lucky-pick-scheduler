@@ -1263,12 +1263,12 @@ def run_all(
         log_payload[f"{prefix}fingerprint/avg_std"] = fp["summary"]["avg_std"]
         log_payload[f"{prefix}fingerprint/avg_sparsity"] = fp["summary"]["avg_sparsity"]
         log_payload[f"{prefix}fingerprint/avg_effective_hidden_dims_1pct"] = fp["summary"]["avg_effective_hidden_dims_1pct"]
-        line_plot = _try_plot_line(fp_layer_table, "layer", "std", "Fingerprint Std by Layer")
+        line_plot = _try_plot_line(fp_layer_table, "layer_label", "std", "Fingerprint Std by Layer")
         if line_plot is not None:
             log_payload[f"{prefix}fingerprint/std_curve"] = line_plot
-        labeled_line_plot = _try_plot_line(fp_layer_table, "layer_label", "std", "Fingerprint Std by Layer (Labeled)")
-        if labeled_line_plot is not None:
-            log_payload[f"{prefix}fingerprint/std_curve_labeled"] = labeled_line_plot
+        numeric_line_plot = _try_plot_line(fp_layer_table, "layer", "std", "Fingerprint Std by Layer (Index)")
+        if numeric_line_plot is not None:
+            log_payload[f"{prefix}fingerprint/std_curve_numeric"] = numeric_line_plot
         transformer_std_plot = _try_plot_bar(
             fp_layer_table,
             "transformer_block",
