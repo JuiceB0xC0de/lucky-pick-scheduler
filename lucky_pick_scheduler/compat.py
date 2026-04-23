@@ -83,9 +83,22 @@ def apply_transformers_remote_code_compat(*, verbose: bool = True) -> List[str]:
 def allow_quantized_training_in_trainer(*, verbose: bool = True) -> List[str]:
     """Patch Trainer quantized-model validation for unsupported quant wrappers.
 
-    Some remote-code quantized models (e.g. BitLinear-based) are trainable in
-    practice but blocked by strict trainer-side validation. This provides an
-    explicit opt-in bypass.
+    Some models (e.g. Falcon-E / Microsoft BitNet after replace_linear_with_bitnet_linear)
+    are legitimately trainable but blocked by transformers' hard check in
+    validate_quantization_for_training.  This is an explicit opt-in bypass.
+
+    Patches three locations to be resilient against different transformers import orders:
+
+    1. ``transformers.trainer_utils.validate_quantization_for_training`` — the
+       canonical definition.
+    2. ``transformers.trainer`` module-level name binding — importlib patch so
+       the module attribute resolves to the no-op.
+    3. ``Trainer.__init__.__globals__['validate_quantization_for_training']`` —
+       the local name captured at the time trainer.py was imported.  This is the
+       binding that actually fires at runtime.  It must be patched even if (1)
+       and (2) are already done.
+
+    This function is idempotent — calling it multiple times is safe.
     """
 
     applied: List[str] = []
@@ -95,36 +108,59 @@ def allow_quantized_training_in_trainer(*, verbose: bool = True) -> List[str]:
 
     import importlib
 
-    for module_name in ("transformers.trainer_utils", "transformers.trainer"):
-        try:
-            module = importlib.import_module(module_name)
-        except Exception:
-            continue
-        fn = getattr(module, "validate_quantization_for_training", None)
-        if fn is None:
-            continue
-        if not hasattr(module, "_lps_orig_validate_quantization_for_training"):
-            setattr(module, "_lps_orig_validate_quantization_for_training", fn)
-            setattr(module, "validate_quantization_for_training", _noop_validate_quantization_for_training)
-            applied.append(f"{module_name}.validate_quantization_for_training")
-
-    # Some Transformers builds bind validate_quantization_for_training into
-    # Trainer.__init__.__globals__ at import time; patch that binding too.
+    # 1. Patch trainer_utils module attribute
     try:
-        trainer_mod = importlib.import_module("transformers.trainer")
-        trainer_cls = getattr(trainer_mod, "Trainer", None)
-        trainer_init = getattr(trainer_cls, "__init__", None)
-        init_globals = getattr(trainer_init, "__globals__", None)
-        if isinstance(init_globals, dict) and "validate_quantization_for_training" in init_globals:
-            if init_globals.get("validate_quantization_for_training") is not _noop_validate_quantization_for_training:
-                init_globals["_lps_orig_validate_quantization_for_training"] = init_globals[
-                    "validate_quantization_for_training"
-                ]
-                init_globals["validate_quantization_for_training"] = _noop_validate_quantization_for_training
-                applied.append("transformers.trainer.Trainer.__init__.__globals__.validate_quantization_for_training")
+        tu = importlib.import_module("transformers.trainer_utils")
+        if getattr(tu, "validate_quantization_for_training", None) is not _noop_validate_quantization_for_training:
+            if not hasattr(tu, "_lps_orig_validate_quantization_for_training"):
+                setattr(tu, "_lps_orig_validate_quantization_for_training",
+                        tu.validate_quantization_for_training)
+            setattr(tu, "validate_quantization_for_training", _noop_validate_quantization_for_training)
+            applied.append("transformers.trainer_utils.validate_quantization_for_training")
+    except Exception:
+        pass
+
+    # 2. Patch transformers.trainer module attribute
+    try:
+        tr = importlib.import_module("transformers.trainer")
+        if getattr(tr, "validate_quantization_for_training", None) is not _noop_validate_quantization_for_training:
+            if not hasattr(tr, "_lps_orig_validate_quantization_for_training"):
+                orig = getattr(tr, "validate_quantization_for_training", None)
+                if orig is not None:
+                    setattr(tr, "_lps_orig_validate_quantization_for_training", orig)
+            setattr(tr, "validate_quantization_for_training", _noop_validate_quantization_for_training)
+            applied.append("transformers.trainer.validate_quantization_for_training")
+    except Exception:
+        pass
+
+    # 3. Patch Trainer.__init__.__globals__ — the binding that actually fires.
+    #    transformers.trainer does:
+    #      from .trainer_utils import validate_quantization_for_training
+    #    which creates a local name in trainer.py's global namespace that is
+    #    captured in Trainer.__init__.__globals__ at import time.  Patching the
+    #    module attribute alone does NOT affect this binding.
+    try:
+        tr = importlib.import_module("transformers.trainer")
+        trainer_cls = getattr(tr, "Trainer", None)
+        if trainer_cls is not None:
+            init_fn = getattr(trainer_cls, "__init__", None)
+            if init_fn is not None:
+                g = getattr(init_fn, "__globals__", None)
+                if isinstance(g, dict):
+                    if g.get("validate_quantization_for_training") is not _noop_validate_quantization_for_training:
+                        orig = g.get("validate_quantization_for_training")
+                        if orig is not None:
+                            g["_lps_orig_validate_quantization_for_training"] = orig
+                        g["validate_quantization_for_training"] = _noop_validate_quantization_for_training
+                        applied.append(
+                            "Trainer.__init__.__globals__.validate_quantization_for_training"
+                        )
     except Exception:
         pass
 
     if verbose and applied:
-        print(f"[lucky_pick_scheduler.compat] Applied patches: {', '.join(applied)}")
+        print(f"[lucky_pick_scheduler.compat] Patched trainer validation: {', '.join(applied)}")
+    elif verbose:
+        print("[lucky_pick_scheduler.compat] Trainer validation already patched (idempotent).")
+
     return applied
