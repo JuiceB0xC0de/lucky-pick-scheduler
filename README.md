@@ -1,6 +1,6 @@
-# BoL W&B Evals
+# BoL Scans
 
-A modular HuggingFace `TrainerCallback` for running the Blocks of Life (BoL) diagnostic suite and logging interactive Custom Charts to Weights & Biases (W&B).
+Trainer-agnostic BoL scan module for running all six model analysis passes against an already-loaded model/tokenizer and logging to W&B.
 
 ## Installation
 
@@ -10,36 +10,35 @@ pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
 
 ## Usage
 
-Drop this into your Unsloth, Axolotl, or standard TRL trainer script to automatically run the BoL suite pre- and post-training:
+Drop this into Unsloth, TRL, HuggingFace Trainer, or any raw training loop:
 
 ```python
 import wandb
-from bol_wandb.callback import BoLWandbCallback
-from transformers import SFTTrainer
+from bol_scans import run_all
 
 # Initialize your model and tokenizer...
 
-# 1. Initialize W&B run
+# 1. Start W&B
 wandb.init(project="my-project", name="bella-v6-eval")
 
-# 2. Setup the BoL Callback
-bol_evals = BoLWandbCallback(
-    model=model,
-    tokenizer=tokenizer,
-    run_pre_train=True,
-    run_post_train=True,
-    # Optional overrides:
-    # eval_texts=["Custom eval text 1", "Custom eval text 2"]
-)
+# 2. Run scans before training
+run_all(model, tokenizer, phase="pre")
 
-# 3. Add to Trainer
-trainer = SFTTrainer(
-    model=model,
-    tokenizer=tokenizer,
-    callbacks=[bol_evals],
-    # ... other args
-)
-
-# 4. Train!
+# 3. Train as usual
 trainer.train()
+
+# 4. Run scans after training
+run_all(model, tokenizer, phase="post")
 ```
+
+`run_all(...)`:
+- Uses the model and tokenizer you already loaded
+- Detects architecture from `model.config` (and model structure fallback)
+- Runs all 6 scans:
+  - weight fingerprint
+  - layer sweep
+  - component ablation
+  - silhouette
+  - CKA
+  - attention map
+- Logs metrics/tables/charts to active `wandb.run` using `pre/*` or `post/*` key prefixes
