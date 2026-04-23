@@ -101,23 +101,40 @@ def _replace_tensor_output(output, new_tensor):
 
 
 def _apply_last_dim_mask(tensor: torch.Tensor, alive: torch.Tensor | None) -> torch.Tensor:
+    """Zero out last-dim channels NOT in *alive*, while keeping the autograd graph intact.
+
+    The old ``new_zeros() + index_copy_()`` implementation created a fresh
+    leaf tensor and copied selected slices into it via an in-place op.  PyTorch
+    cannot reliably back-propagate through that pattern — the resulting ``out``
+    tensor has no ``grad_fn`` connected to the original ``tensor``, so all
+    hooked projections receive zero (or undefined) gradients, producing
+    grad_norm=NaN from step 0.
+
+    The replacement builds a float mask of 0/1 values and multiplies element-
+    wise.  Multiplication is fully differentiable: gradients flow back through
+    the alive channels unchanged and are zeroed on the dead channels, which is
+    exactly the intended semantics.
+    """
     if alive is None:
         return tensor
     if tensor.ndim == 0:
         return tensor
-    if tensor.shape[-1] <= 0:
+    dim = int(tensor.shape[-1])
+    if dim <= 0:
         return tensor
     if alive.numel() == 0:
-        return tensor.new_zeros(tensor.shape)
+        # All channels dead — multiply by a zero scalar so grad_fn is preserved.
+        return tensor * 0.0
     alive = alive.to(device=tensor.device, dtype=torch.long)
-    valid = alive[(alive >= 0) & (alive < int(tensor.shape[-1]))]
+    valid = alive[(alive >= 0) & (alive < dim)]
     if valid.numel() == 0:
-        return tensor.new_zeros(tensor.shape)
-    if valid.numel() > 1:
-        valid = torch.unique(valid, sorted=True)
-    out = tensor.new_zeros(tensor.shape)
-    out.index_copy_(-1, valid, tensor.index_select(-1, valid))
-    return out
+        return tensor * 0.0
+    # Build a float mask on the last dimension: 1.0 for alive channels, 0.0 for dead.
+    mask = torch.zeros(dim, dtype=tensor.dtype, device=tensor.device)
+    mask[valid] = 1.0
+    # Broadcast mask over all leading dimensions and multiply.
+    # This is differentiable: grad flows through alive positions unchanged.
+    return tensor * mask
 
 
 def _safe_int(value: Any, default: int | None = None) -> int | None:
@@ -625,11 +642,14 @@ class DeepChaosScheduler:
                 return output
 
             if topo.mode in ("dead", "identity"):
-                return _replace_tensor_output(output, tensor.new_zeros(tensor.shape))
+                # Multiply by 0.0 instead of new_zeros() so the grad_fn stays
+                # connected to the original tensor.  new_zeros() creates a fresh
+                # leaf with requires_grad=False, cutting the autograd graph.
+                return _replace_tensor_output(output, tensor * 0.0)
 
             if component in {"q", "k", "v", "o"}:
                 if not attn_enabled:
-                    return _replace_tensor_output(output, tensor.new_zeros(tensor.shape))
+                    return _replace_tensor_output(output, tensor * 0.0)
                 alive = {
                     "q": topo.alive_q_out,
                     "k": topo.alive_k_out,
@@ -640,7 +660,7 @@ class DeepChaosScheduler:
 
             if component in {"gate", "up", "down"}:
                 if not mlp_enabled:
-                    return _replace_tensor_output(output, tensor.new_zeros(tensor.shape))
+                    return _replace_tensor_output(output, tensor * 0.0)
                 alive = {
                     "gate": topo.alive_gate_out,
                     "up": topo.alive_up_out,
