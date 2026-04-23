@@ -5,7 +5,7 @@ A modular HuggingFace `TrainerCallback` for running the Blocks of Life (BoL) dia
 ## Installation
 
 ```bash
-pip install git+https://github.com/juiceb0xc0de/bol-wandb-evals.git
+pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
 ```
 
 ## Usage
