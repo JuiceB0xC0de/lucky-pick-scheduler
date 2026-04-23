@@ -109,8 +109,14 @@ def _apply_last_dim_mask(tensor: torch.Tensor, alive: torch.Tensor | None) -> to
         return tensor
     if alive.numel() == 0:
         return tensor.new_zeros(tensor.shape)
+    alive = alive.to(device=tensor.device, dtype=torch.long)
+    valid = alive[(alive >= 0) & (alive < int(tensor.shape[-1]))]
+    if valid.numel() == 0:
+        return tensor.new_zeros(tensor.shape)
+    if valid.numel() > 1:
+        valid = torch.unique(valid, sorted=True)
     out = tensor.new_zeros(tensor.shape)
-    out.index_copy_(-1, alive.to(device=tensor.device), tensor.index_select(-1, alive.to(device=tensor.device)))
+    out.index_copy_(-1, valid, tensor.index_select(-1, valid))
     return out
 
 
