@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Any, Dict, List, Sequence, Tuple
 
 import torch
@@ -17,16 +17,67 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
 
 def resolve_transformer_layers(model: torch.nn.Module) -> List[torch.nn.Module]:
     base = _unwrap_model(model)
-    candidates = [
-        getattr(getattr(base, "model", None), "layers", None),
-        getattr(getattr(getattr(base, "model", None), "decoder", None), "layers", None),
-        getattr(getattr(base, "transformer", None), "h", None),
-        getattr(getattr(base, "gpt_neox", None), "layers", None),
-        getattr(base, "layers", None),
+
+    def _get_dotted_attr(obj: Any, dotted: str):
+        current = obj
+        for part in dotted.split("."):
+            if not hasattr(current, part):
+                return None
+            current = getattr(current, part)
+        return current
+
+    explicit_paths = [
+        "model.layers",
+        "model.model.layers",
+        "model.decoder.layers",
+        "model.language_model.layers",
+        "language_model.model.layers",
+        "language_model.layers",
+        "text_model.layers",
+        "decoder.layers",
+        "transformer.layers",
+        "transformer.h",
+        "gpt_neox.layers",
+        "layers",
     ]
-    for layers in candidates:
-        if isinstance(layers, (list, torch.nn.ModuleList)) and len(layers) > 0:
+    for path in explicit_paths:
+        layers = _get_dotted_attr(base, path)
+        if isinstance(layers, (list, tuple, torch.nn.ModuleList)) and len(layers) > 0:
             return list(layers)
+
+    def _block_score(module: torch.nn.Module) -> int:
+        score = 0
+        if hasattr(module, "self_attn") or hasattr(module, "attention") or hasattr(module, "attn"):
+            score += 2
+        if hasattr(module, "mlp") or hasattr(module, "feed_forward") or hasattr(module, "ffn"):
+            score += 2
+        name = module.__class__.__name__.lower()
+        if "decoder" in name or "block" in name or "layer" in name:
+            score += 1
+        return score
+
+    best_layers = None
+    best_score = float("-inf")
+    for name, module in base.named_modules():
+        if not isinstance(module, torch.nn.ModuleList) or len(module) == 0:
+            continue
+        samples = list(module[: min(4, len(module))])
+        child_score = sum(_block_score(child) for child in samples) / max(1, len(samples))
+        path_score = 0.0
+        lname = name.lower()
+        if "language_model" in lname or "text" in lname or "decoder" in lname:
+            path_score += 3.0
+        if lname.endswith("layers") or lname.endswith(".layers") or lname.endswith(".h") or lname.endswith("blocks"):
+            path_score += 2.0
+        if "vision" in lname or "image" in lname or "audio" in lname or "encoder" in lname:
+            path_score -= 4.0
+        total_score = child_score + path_score + (0.01 * len(module))
+        if total_score > best_score:
+            best_score = total_score
+            best_layers = module
+
+    if best_layers is not None and len(best_layers) > 0:
+        return list(best_layers)
     raise AttributeError("Could not infer transformer decoder layers from model structure.")
 
 
@@ -557,4 +608,3 @@ class DeepChaosScheduler:
         self.cached_stats = None
         self.last_shuffle_step = None
         print("DeepChaosScheduler removed")
-
