@@ -114,6 +114,36 @@ COMPONENT_PRIORITY = [
 ]
 
 
+def _component_label(param_name: str) -> str:
+    if "self_attn.q_proj" in param_name:
+        return "q_proj"
+    if "self_attn.k_proj" in param_name:
+        return "k_proj"
+    if "self_attn.v_proj" in param_name:
+        return "v_proj"
+    if "self_attn.o_proj" in param_name:
+        return "o_proj"
+    if "mlp.gate_proj" in param_name:
+        return "gate_proj"
+    if "mlp.up_proj" in param_name:
+        return "up_proj"
+    if "mlp.down_proj" in param_name:
+        return "down_proj"
+    if "self_attn" in param_name:
+        return "attn_other"
+    if "mlp" in param_name:
+        return "mlp_other"
+    return "other"
+
+
+def _component_family(component: str) -> str:
+    if component in {"q_proj", "k_proj", "v_proj", "o_proj", "attn_other"}:
+        return "attention"
+    if component in {"gate_proj", "up_proj", "down_proj", "mlp_other"}:
+        return "mlp"
+    return "other"
+
+
 def _pad_token_id(tokenizer) -> int | None:
     if tokenizer.pad_token_id is not None:
         return int(tokenizer.pad_token_id)
@@ -295,16 +325,39 @@ def _compute_weight_fingerprint(
     layer_abs_means: Dict[int, List[float]] = {}
     layer_stds: Dict[int, List[float]] = {}
     layer_sparsity: Dict[int, List[float]] = {}
+    component_abs_means: Dict[Tuple[int, str], List[float]] = {}
+    component_stds: Dict[Tuple[int, str], List[float]] = {}
+    component_sparsity: Dict[Tuple[int, str], List[float]] = {}
+    component_counts: Dict[Tuple[int, str], int] = {}
+    layer_input_dims: Dict[int, List[int]] = {}
+    layer_col_energies: Dict[int, List[Tuple[int, np.ndarray]]] = {}
+    layer_dims_info: Dict[int, Dict[str, Any]] = {}
+
+    def _layer_info(layer_idx: int) -> Dict[str, Any]:
+        if layer_idx not in layer_dims_info:
+            layer_dims_info[layer_idx] = {
+                "hidden_dim": None,
+                "attn_q_out_dim": None,
+                "attn_k_out_dim": None,
+                "attn_v_out_dim": None,
+                "attn_o_in_dim": None,
+                "mlp_intermediate_dim": None,
+                "mlp_down_in_dim": None,
+            }
+        return layer_dims_info[layer_idx]
 
     for layer_idx, layer_name, layer_module in layers:
         for local_name, param in layer_module.named_parameters(recurse=True):
             if param.ndim < 2:
                 continue
             full_name = f"{layer_name}.{local_name}"
+            component = _component_label(local_name)
             data = param.detach().float()
             stats: Dict[str, Any] = {
                 "layer": layer_idx,
                 "name": full_name,
+                "component": component,
+                "family": _component_family(component),
                 "shape": list(param.shape),
                 "mean": float(data.mean().item()),
                 "std": float(data.std().item()),
@@ -325,6 +378,32 @@ def _compute_weight_fingerprint(
             layer_abs_means.setdefault(layer_idx, []).append(stats["abs_mean"])
             layer_stds.setdefault(layer_idx, []).append(stats["std"])
             layer_sparsity.setdefault(layer_idx, []).append(stats["sparsity"])
+            key = (layer_idx, component)
+            component_abs_means.setdefault(key, []).append(stats["abs_mean"])
+            component_stds.setdefault(key, []).append(stats["std"])
+            component_sparsity.setdefault(key, []).append(stats["sparsity"])
+            component_counts[key] = component_counts.get(key, 0) + 1
+
+            layer_input_dims.setdefault(layer_idx, []).append(int(param.shape[1]))
+            col_energy = data.pow(2).sum(dim=0).detach().cpu().numpy()
+            layer_col_energies.setdefault(layer_idx, []).append((int(param.shape[1]), col_energy))
+
+            info = _layer_info(layer_idx)
+            if local_name.endswith("self_attn.q_proj.weight"):
+                info["attn_q_out_dim"] = int(param.shape[0])
+                info["hidden_dim"] = int(param.shape[1])
+            elif local_name.endswith("self_attn.k_proj.weight"):
+                info["attn_k_out_dim"] = int(param.shape[0])
+            elif local_name.endswith("self_attn.v_proj.weight"):
+                info["attn_v_out_dim"] = int(param.shape[0])
+            elif local_name.endswith("self_attn.o_proj.weight"):
+                info["attn_o_in_dim"] = int(param.shape[1])
+            elif local_name.endswith("mlp.gate_proj.weight"):
+                info["mlp_intermediate_dim"] = int(param.shape[0])
+                if info["hidden_dim"] is None:
+                    info["hidden_dim"] = int(param.shape[1])
+            elif local_name.endswith("mlp.down_proj.weight"):
+                info["mlp_down_in_dim"] = int(param.shape[1])
 
     layer_summary = []
     for layer_idx in sorted(layer_abs_means):
@@ -337,14 +416,69 @@ def _compute_weight_fingerprint(
             }
         )
 
+    layer_component_summary = []
+    for (layer_idx, component), values in sorted(component_abs_means.items(), key=lambda x: (x[0][0], x[0][1])):
+        layer_component_summary.append(
+            {
+                "layer": layer_idx,
+                "component": component,
+                "family": _component_family(component),
+                "abs_mean": float(np.mean(values)),
+                "std": float(np.mean(component_stds[(layer_idx, component)])),
+                "sparsity": float(np.mean(component_sparsity[(layer_idx, component)])),
+                "tensor_count": int(component_counts[(layer_idx, component)]),
+            }
+        )
+
+    layer_dimension_summary = []
+    for layer_idx in sorted(layer_input_dims.keys()):
+        info = _layer_info(layer_idx)
+        if info["hidden_dim"] is None and layer_input_dims[layer_idx]:
+            # Fallback: use most common input width in this layer.
+            info["hidden_dim"] = int(Counter(layer_input_dims[layer_idx]).most_common(1)[0][0])
+        hidden_dim = info["hidden_dim"]
+        effective_nonzero = None
+        effective_1pct = None
+        if hidden_dim is not None and hidden_dim > 0:
+            energies = [
+                col_energy
+                for dim, col_energy in layer_col_energies.get(layer_idx, [])
+                if dim == hidden_dim and col_energy.shape[0] == hidden_dim
+            ]
+            if energies:
+                combined = np.sum(np.stack(energies), axis=0)
+                max_energy = float(np.max(combined)) if combined.size else 0.0
+                effective_nonzero = int(np.sum(combined > 0.0))
+                effective_1pct = int(np.sum(combined > (0.01 * max_energy))) if max_energy > 0 else 0
+
+        layer_dimension_summary.append(
+            {
+                "layer": layer_idx,
+                "hidden_dim": hidden_dim,
+                "effective_hidden_dims_nonzero": effective_nonzero,
+                "effective_hidden_dims_1pct": effective_1pct,
+                "attn_q_out_dim": info["attn_q_out_dim"],
+                "attn_k_out_dim": info["attn_k_out_dim"],
+                "attn_v_out_dim": info["attn_v_out_dim"],
+                "attn_o_in_dim": info["attn_o_in_dim"],
+                "mlp_intermediate_dim": info["mlp_intermediate_dim"],
+                "mlp_down_in_dim": info["mlp_down_in_dim"],
+            }
+        )
+
+    effective_counts = [r["effective_hidden_dims_1pct"] for r in layer_dimension_summary if r["effective_hidden_dims_1pct"] is not None]
+
     return {
         "rows": rows,
         "layer_summary": layer_summary,
+        "layer_component_summary": layer_component_summary,
+        "layer_dimension_summary": layer_dimension_summary,
         "summary": {
             "tensor_count": len(rows),
             "avg_abs_mean": float(np.mean([r["abs_mean"] for r in rows])) if rows else 0.0,
             "avg_std": float(np.mean([r["std"] for r in rows])) if rows else 0.0,
             "avg_sparsity": float(np.mean([r["sparsity"] for r in rows])) if rows else 0.0,
+            "avg_effective_hidden_dims_1pct": float(np.mean(effective_counts)) if effective_counts else 0.0,
         },
     }
 
@@ -919,11 +1053,13 @@ def run_all(
     if "weight_fingerprint" in results:
         fp = results["weight_fingerprint"]
         fp_table = wandb.Table(
-            columns=["layer", "name", "mean", "std", "abs_mean", "sparsity", "frobenius", "spectral_norm"],
+            columns=["layer", "name", "component", "family", "mean", "std", "abs_mean", "sparsity", "frobenius", "spectral_norm"],
             data=[
                 [
                     row["layer"],
                     row["name"],
+                    row["component"],
+                    row["family"],
                     row["mean"],
                     row["std"],
                     row["abs_mean"],
@@ -941,15 +1077,97 @@ def run_all(
                 for row in fp["layer_summary"]
             ],
         )
+        fp_component_table = wandb.Table(
+            columns=["layer", "component", "family", "abs_mean", "std", "sparsity", "tensor_count"],
+            data=[
+                [
+                    row["layer"],
+                    row["component"],
+                    row["family"],
+                    row["abs_mean"],
+                    row["std"],
+                    row["sparsity"],
+                    row["tensor_count"],
+                ]
+                for row in fp["layer_component_summary"]
+            ],
+        )
+        fp_dim_table = wandb.Table(
+            columns=[
+                "layer",
+                "hidden_dim",
+                "effective_hidden_dims_nonzero",
+                "effective_hidden_dims_1pct",
+                "attn_q_out_dim",
+                "attn_k_out_dim",
+                "attn_v_out_dim",
+                "attn_o_in_dim",
+                "mlp_intermediate_dim",
+                "mlp_down_in_dim",
+            ],
+            data=[
+                [
+                    row["layer"],
+                    row["hidden_dim"],
+                    row["effective_hidden_dims_nonzero"],
+                    row["effective_hidden_dims_1pct"],
+                    row["attn_q_out_dim"],
+                    row["attn_k_out_dim"],
+                    row["attn_v_out_dim"],
+                    row["attn_o_in_dim"],
+                    row["mlp_intermediate_dim"],
+                    row["mlp_down_in_dim"],
+                ]
+                for row in fp["layer_dimension_summary"]
+            ],
+        )
         log_payload[f"{prefix}fingerprint/table"] = fp_table
         log_payload[f"{prefix}fingerprint/layer_table"] = fp_layer_table
+        log_payload[f"{prefix}fingerprint/component_layer_table"] = fp_component_table
+        log_payload[f"{prefix}fingerprint/layer_dimension_table"] = fp_dim_table
         log_payload[f"{prefix}fingerprint/tensor_count"] = fp["summary"]["tensor_count"]
         log_payload[f"{prefix}fingerprint/avg_abs_mean"] = fp["summary"]["avg_abs_mean"]
         log_payload[f"{prefix}fingerprint/avg_std"] = fp["summary"]["avg_std"]
         log_payload[f"{prefix}fingerprint/avg_sparsity"] = fp["summary"]["avg_sparsity"]
+        log_payload[f"{prefix}fingerprint/avg_effective_hidden_dims_1pct"] = fp["summary"]["avg_effective_hidden_dims_1pct"]
         line_plot = _try_plot_line(fp_layer_table, "layer", "std", "Fingerprint Std by Layer")
         if line_plot is not None:
             log_payload[f"{prefix}fingerprint/std_curve"] = line_plot
+        component_std_heatmap = _try_plot_heatmap(
+            fp_component_table,
+            "layer",
+            "component",
+            "std",
+            "Fingerprint Std by Layer + Component",
+        )
+        if component_std_heatmap is not None:
+            log_payload[f"{prefix}fingerprint/component_std_heatmap"] = component_std_heatmap
+        component_abs_heatmap = _try_plot_heatmap(
+            fp_component_table,
+            "layer",
+            "component",
+            "abs_mean",
+            "Fingerprint Abs Mean by Layer + Component",
+        )
+        if component_abs_heatmap is not None:
+            log_payload[f"{prefix}fingerprint/component_abs_mean_heatmap"] = component_abs_heatmap
+        effective_dim_table = wandb.Table(
+            columns=["layer", "effective_hidden_dims_1pct"],
+            data=[
+                [row["layer"], row["effective_hidden_dims_1pct"]]
+                for row in fp["layer_dimension_summary"]
+                if row["effective_hidden_dims_1pct"] is not None
+            ],
+        )
+        if len(effective_dim_table.data) > 0:
+            effective_line = _try_plot_line(
+                effective_dim_table,
+                "layer",
+                "effective_hidden_dims_1pct",
+                "Effective Hidden Dims (>1% Column Energy)",
+            )
+            if effective_line is not None:
+                log_payload[f"{prefix}fingerprint/effective_hidden_dims_curve"] = effective_line
 
     if "layer_sweep" in results:
         sweep = results["layer_sweep"]

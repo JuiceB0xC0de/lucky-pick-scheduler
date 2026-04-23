@@ -41,4 +41,5 @@ run_all(model, tokenizer, phase="post")
   - silhouette
   - CKA
   - attention map
+- Adds component-aware fingerprint panels (`q/k/v/o`, `gate/up/down`) and per-layer dimension profile tables
 - Logs metrics/tables/charts to active `wandb.run` using `pre/*` or `post/*` key prefixes
