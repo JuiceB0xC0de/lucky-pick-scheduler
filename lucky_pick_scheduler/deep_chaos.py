@@ -172,6 +172,11 @@ class LayerBindings:
     head_dim: int | None = None
     supports_attention_masks: bool = False
     supports_mlp_masks: bool = False
+    # When True, this layer reuses K/V states from an earlier layer (e.g.
+    # Gemma-4 num_kv_shared_layers).  k_proj / v_proj are absent or irrelevant
+    # and MUST NOT be hooked — doing so would corrupt the shared state used by
+    # all downstream layers that depend on it, causing NaN gradients.
+    kv_shared: bool = False
 
 
 @dataclass
@@ -254,6 +259,40 @@ class DeepChaosScheduler:
                 resolved.append(idx_i)
         return resolved
 
+    @staticmethod
+    def _detect_kv_shared(attn: torch.nn.Module) -> bool:
+        """Return True if this attention layer reuses K/V from another layer.
+
+        Covers:
+        - Gemma-4: ``is_kv_shared_layer`` attribute set to True
+        - Any layer where k_proj / v_proj are absent (no attribute at all)
+        """
+        # Explicit flag set by transformers (Gemma-4)
+        if getattr(attn, "is_kv_shared_layer", False):
+            return True
+        # Implicit: k_proj exists but is None (use_alternative_attention path)
+        # We check for total absence of both k_proj and v_proj as a heuristic
+        has_k = _first_attr(attn, ("k_proj", "key", "wk")) is not None
+        has_v = _first_attr(attn, ("v_proj", "value", "wv")) is not None
+        if not has_k and not has_v:
+            return True
+        return False
+
+    @staticmethod
+    def _has_post_proj_norm(attn: torch.nn.Module) -> bool:
+        """Return True if the attention module normalises q/k/v AFTER projection.
+
+        Examples: Gemma-4 (q_norm, k_norm, v_norm), Gemma-2 (q_norm, k_norm).
+        When this is True, zeroing raw projection outputs triggers division-by-
+        zero (RMSNorm denominator collapses) or very large rescaling.  We skip
+        q/k/v hooks and only hook o_proj in this case.
+        """
+        return (
+            hasattr(attn, "q_norm")
+            or hasattr(attn, "k_norm")
+            or hasattr(attn, "v_norm")
+        )
+
     def _build_layer_bindings(self):
         for layer_idx in self.victims:
             layer = self.layers[layer_idx]
@@ -262,9 +301,14 @@ class DeepChaosScheduler:
             attn = _first_attr(layer, ("self_attn", "attn", "attention"))
             binding.attn_module = attn
             if attn is not None:
+                binding.kv_shared = self._detect_kv_shared(attn)
+                has_post_norm = self._has_post_proj_norm(attn)
+
                 binding.q_proj = _first_attr(attn, ("q_proj", "query", "wq"))
-                binding.k_proj = _first_attr(attn, ("k_proj", "key", "wk"))
-                binding.v_proj = _first_attr(attn, ("v_proj", "value", "wv"))
+                # Only resolve k/v projections if this layer owns them
+                if not binding.kv_shared:
+                    binding.k_proj = _first_attr(attn, ("k_proj", "key", "wk"))
+                    binding.v_proj = _first_attr(attn, ("v_proj", "value", "wv"))
                 binding.o_proj = _first_attr(attn, ("o_proj", "out_proj", "dense", "wo"))
                 binding.num_heads = _safe_int(
                     _first_attr(attn, ("num_heads", "num_attention_heads", "n_heads"))
@@ -274,8 +318,19 @@ class DeepChaosScheduler:
                     default=binding.num_heads,
                 )
                 binding.head_dim = _safe_int(_first_attr(attn, ("head_dim",)))
+                # supports_attention_masks: we can hook q/k/v projections only
+                # when:
+                #   1. All four projections exist on this layer
+                #   2. The architecture does NOT apply per-head norms after
+                #      projection (q_norm / k_norm / v_norm).  Post-proj norms
+                #      make partial-zeroing of projection outputs unsafe because
+                #      the RMSNorm denominator can collapse toward zero, causing
+                #      NaN.  When post-proj norms are present we fall back to
+                #      hooking only o_proj.
                 binding.supports_attention_masks = (
-                    binding.q_proj is not None
+                    not has_post_norm
+                    and not binding.kv_shared
+                    and binding.q_proj is not None
                     and binding.k_proj is not None
                     and binding.v_proj is not None
                     and binding.o_proj is not None
@@ -600,12 +655,23 @@ class DeepChaosScheduler:
     def _install_hooks(self):
         for layer_idx in self.victims:
             binding = self.bindings[layer_idx]
-            if binding.q_proj is not None:
-                self._install_hook_for_component(layer_idx, "q", binding.q_proj)
-            if binding.k_proj is not None:
-                self._install_hook_for_component(layer_idx, "k", binding.k_proj)
-            if binding.v_proj is not None:
-                self._install_hook_for_component(layer_idx, "v", binding.v_proj)
+
+            # Attention hooks.
+            # q/k/v projections are only hooked when supports_attention_masks is
+            # True — this excludes architectures with post-projection norms
+            # (Gemma-2/4 q_norm/k_norm) and KV-sharing layers.  Hooking those
+            # would corrupt the shared KV cache used by downstream layers or
+            # cause RMSNorm denominator collapse, both producing NaN gradients.
+            if binding.supports_attention_masks:
+                if binding.q_proj is not None:
+                    self._install_hook_for_component(layer_idx, "q", binding.q_proj)
+                if binding.k_proj is not None:
+                    self._install_hook_for_component(layer_idx, "k", binding.k_proj)
+                if binding.v_proj is not None:
+                    self._install_hook_for_component(layer_idx, "v", binding.v_proj)
+            # o_proj is always safe to hook — it runs after all norms and KV
+            # operations.  It is the only attention hook applied on architectures
+            # with post-projection norms or KV-shared layers.
             if binding.o_proj is not None:
                 self._install_hook_for_component(layer_idx, "o", binding.o_proj)
 
