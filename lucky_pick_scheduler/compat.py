@@ -48,15 +48,33 @@ def apply_transformers_remote_code_compat(*, verbose: bool = True) -> List[str]:
                     raise
                 tied = getattr(self, "_tied_weights_keys", None)
                 if isinstance(tied, dict):
-                    return list(tied.keys()) + [v for v in tied.values() if isinstance(v, str)]
+                    return dict(tied)
                 if isinstance(tied, (list, tuple, set)):
-                    return [item for item in tied if isinstance(item, str)]
-                return []
+                    items = [item for item in tied if isinstance(item, str)]
+                    return {item: item for item in items}
+                return {}
 
         PreTrainedModel.get_expanded_tied_weights_keys = _patched_get_expanded_tied_weights_keys  # type: ignore[assignment]
         applied.append("modeling_utils.get_expanded_tied_weights_keys")
 
+    if not hasattr(PreTrainedModel, "_lps_orig_mark_tied_weights_as_initialized"):
+        PreTrainedModel._lps_orig_mark_tied_weights_as_initialized = PreTrainedModel.mark_tied_weights_as_initialized  # type: ignore[attr-defined]
+
+        def _patched_mark_tied_weights_as_initialized(self, loading_info):
+            tied = getattr(self, "all_tied_weights_keys", None)
+            if isinstance(tied, (list, tuple, set)):
+                items = [item for item in tied if isinstance(item, str)]
+                setattr(self, "all_tied_weights_keys", {item: item for item in items})
+            elif isinstance(tied, dict):
+                # keep as-is
+                pass
+            elif tied is None:
+                setattr(self, "all_tied_weights_keys", {})
+            return PreTrainedModel._lps_orig_mark_tied_weights_as_initialized(self, loading_info)  # type: ignore[attr-defined]
+
+        PreTrainedModel.mark_tied_weights_as_initialized = _patched_mark_tied_weights_as_initialized  # type: ignore[assignment]
+        applied.append("modeling_utils.mark_tied_weights_as_initialized")
+
     if verbose and applied:
         print(f"[lucky_pick_scheduler.compat] Applied patches: {', '.join(applied)}")
     return applied
-
