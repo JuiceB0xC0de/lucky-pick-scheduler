@@ -78,3 +78,36 @@ def apply_transformers_remote_code_compat(*, verbose: bool = True) -> List[str]:
     if verbose and applied:
         print(f"[lucky_pick_scheduler.compat] Applied patches: {', '.join(applied)}")
     return applied
+
+
+def allow_quantized_training_in_trainer(*, verbose: bool = True) -> List[str]:
+    """Patch Trainer quantized-model validation for unsupported quant wrappers.
+
+    Some remote-code quantized models (e.g. BitLinear-based) are trainable in
+    practice but blocked by strict trainer-side validation. This provides an
+    explicit opt-in bypass.
+    """
+
+    applied: List[str] = []
+
+    def _noop_validate_quantization_for_training(_model):
+        return None
+
+    import importlib
+
+    for module_name in ("transformers.trainer_utils", "transformers.trainer"):
+        try:
+            module = importlib.import_module(module_name)
+        except Exception:
+            continue
+        fn = getattr(module, "validate_quantization_for_training", None)
+        if fn is None:
+            continue
+        if not hasattr(module, "_lps_orig_validate_quantization_for_training"):
+            setattr(module, "_lps_orig_validate_quantization_for_training", fn)
+            setattr(module, "validate_quantization_for_training", _noop_validate_quantization_for_training)
+            applied.append(f"{module_name}.validate_quantization_for_training")
+
+    if verbose and applied:
+        print(f"[lucky_pick_scheduler.compat] Applied patches: {', '.join(applied)}")
+    return applied

@@ -241,6 +241,9 @@ model, prep_report = prepare_model_for_training(
         lora_r=16,
         lora_alpha=32,
         lora_dropout=0.05,
+        # optional fallbacks for quantized wrappers (e.g. BitLinear):
+        # try_dequantize_if_available=True,
+        # allow_trainer_quantization_bypass=True,
     ),
 )
 print(prep_report.to_dict())
@@ -249,6 +252,9 @@ dc = DeepChaosScheduler(resolve_scheduler_model(model), DeepChaosConfig())
 ```
 
 For non-quantized models, `prepare_model_for_training` is a no-op.
+For quantized checkpoints, it first tries LoRA injection on PEFT-supported module
+types, then can optionally try dequantization, and finally can apply an explicit
+Trainer quantization-validation bypass as a last-resort compatibility path.
 
 ---
 

@@ -1,4 +1,4 @@
-from .compat import apply_transformers_remote_code_compat
+from .compat import allow_quantized_training_in_trainer, apply_transformers_remote_code_compat
 from .deep_chaos import DeepChaosConfig, DeepChaosScheduler, resolve_transformer_layers
 from .model_prep import (
     ModelPrepConfig,
@@ -18,6 +18,7 @@ from .scheduler import (
 
 __all__ = [
     "AutoSchedulerConfig",
+    "allow_quantized_training_in_trainer",
     "apply_transformers_remote_code_compat",
     "DeepChaosConfig",
     "DeepChaosScheduler",

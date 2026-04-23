@@ -7,6 +7,8 @@ from typing import List, Sequence
 
 import torch
 
+from .compat import allow_quantized_training_in_trainer
+
 
 @dataclass
 class ModelPrepConfig:
@@ -16,6 +18,8 @@ class ModelPrepConfig:
     lora_dropout: float = 0.05
     lora_bias: str = "none"
     lora_target_modules: Sequence[str] | None = None
+    try_dequantize_if_available: bool = True
+    allow_trainer_quantization_bypass: bool = True
     verbose: bool = True
 
 
@@ -23,13 +27,19 @@ class ModelPrepConfig:
 class ModelPrepReport:
     quantized_detected: bool
     auto_lora_applied: bool
+    dequantized: bool
+    trainer_quantization_bypass_applied: bool
     lora_target_modules: List[str]
+    notes: List[str]
 
     def to_dict(self):
         return {
             "quantized_detected": bool(self.quantized_detected),
             "auto_lora_applied": bool(self.auto_lora_applied),
+            "dequantized": bool(self.dequantized),
+            "trainer_quantization_bypass_applied": bool(self.trainer_quantization_bypass_applied),
             "lora_target_modules": list(self.lora_target_modules),
+            "notes": list(self.notes),
         }
 
 
@@ -61,25 +71,28 @@ def infer_lora_target_modules(model: torch.nn.Module, preferred: Sequence[str] |
         )
     )
 
-    linear_like_leaf_names: set[str] = set()
+    supported_leaf_names: set[str] = set()
+
+    supported_types = [torch.nn.Linear, torch.nn.Embedding, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d]
+    try:
+        from transformers.pytorch_utils import Conv1D as HFConv1D  # type: ignore
+
+        supported_types.append(HFConv1D)
+    except Exception:
+        pass
+    supported_tuple = tuple(supported_types)
+
     for name, module in model.named_modules():
         if not name:
             continue
         leaf = name.split(".")[-1]
-        if isinstance(module, torch.nn.Linear):
-            linear_like_leaf_names.add(leaf)
-            continue
-        weight = getattr(module, "weight", None)
-        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
-            class_name_l = module.__class__.__name__.lower()
-            if "norm" in class_name_l or "embed" in class_name_l:
-                continue
-            linear_like_leaf_names.add(leaf)
+        if isinstance(module, supported_tuple):
+            supported_leaf_names.add(leaf)
 
-    selected = [name for name in preferred if name in linear_like_leaf_names]
+    selected = [name for name in preferred if name in supported_leaf_names]
     if selected:
         return selected
-    return sorted(linear_like_leaf_names)
+    return sorted(supported_leaf_names)
 
 
 def resolve_scheduler_model(model: torch.nn.Module) -> torch.nn.Module:
@@ -100,7 +113,10 @@ def prepare_model_for_training(
     cfg = config or ModelPrepConfig()
     quantized = is_quantized_model(model)
     auto_lora_applied = False
+    dequantized = False
+    trainer_quantization_bypass_applied = False
     lora_target_modules: List[str] = []
+    notes: List[str] = []
 
     if quantized and bool(cfg.auto_lora_for_quantized):
         try:
@@ -111,32 +127,62 @@ def prepare_model_for_training(
             ) from exc
 
         lora_target_modules = list(cfg.lora_target_modules or infer_lora_target_modules(model))
-        if not lora_target_modules:
-            raise RuntimeError(
-                "Quantized model detected but no linear target modules were found for LoRA adapters."
+        if lora_target_modules:
+            lora_cfg = LoraConfig(
+                task_type=TaskType.CAUSAL_LM,
+                r=int(cfg.lora_r),
+                lora_alpha=int(cfg.lora_alpha),
+                lora_dropout=float(cfg.lora_dropout),
+                bias=str(cfg.lora_bias),
+                target_modules=lora_target_modules,
             )
-        lora_cfg = LoraConfig(
-            task_type=TaskType.CAUSAL_LM,
-            r=int(cfg.lora_r),
-            lora_alpha=int(cfg.lora_alpha),
-            lora_dropout=float(cfg.lora_dropout),
-            bias=str(cfg.lora_bias),
-            target_modules=lora_target_modules,
-        )
-        model = get_peft_model(model, lora_cfg)
-        auto_lora_applied = True
-        if cfg.verbose:
-            print(
-                "Auto-LoRA applied for quantized model. "
-                f"targets={lora_target_modules}"
-            )
-            if hasattr(model, "print_trainable_parameters"):
-                model.print_trainable_parameters()
+            try:
+                model = get_peft_model(model, lora_cfg)
+                auto_lora_applied = True
+                if cfg.verbose:
+                    print(
+                        "Auto-LoRA applied for quantized model. "
+                        f"targets={lora_target_modules}"
+                    )
+                    if hasattr(model, "print_trainable_parameters"):
+                        model.print_trainable_parameters()
+            except Exception as exc:
+                notes.append(f"auto_lora_failed:{exc}")
+                if cfg.verbose:
+                    print(f"Auto-LoRA injection failed for quantized model: {exc}")
+        else:
+            notes.append("no_supported_lora_target_modules")
+            if cfg.verbose:
+                print("No PEFT-supported target modules found for quantized model; skipping auto-LoRA.")
+
+    if quantized and not auto_lora_applied and bool(cfg.try_dequantize_if_available) and hasattr(model, "dequantize"):
+        try:
+            maybe_model = model.dequantize()  # some APIs mutate in place and return None
+            if isinstance(maybe_model, torch.nn.Module):
+                model = maybe_model
+            quantized = is_quantized_model(model)
+            dequantized = not quantized
+            if dequantized:
+                notes.append("dequantized_model")
+                if cfg.verbose:
+                    print("Dequantized model for training compatibility.")
+        except Exception as exc:
+            notes.append(f"dequantize_failed:{exc}")
+            if cfg.verbose:
+                print(f"Dequantize attempt failed: {exc}")
+
+    if quantized and not auto_lora_applied and bool(cfg.allow_trainer_quantization_bypass):
+        patched = allow_quantized_training_in_trainer(verbose=cfg.verbose)
+        trainer_quantization_bypass_applied = len(patched) > 0
+        if trainer_quantization_bypass_applied:
+            notes.append("trainer_quantization_validation_bypassed")
 
     report = ModelPrepReport(
         quantized_detected=bool(quantized),
         auto_lora_applied=bool(auto_lora_applied),
+        dequantized=bool(dequantized),
+        trainer_quantization_bypass_applied=bool(trainer_quantization_bypass_applied),
         lora_target_modules=lora_target_modules,
+        notes=notes,
     )
     return model, report
-
