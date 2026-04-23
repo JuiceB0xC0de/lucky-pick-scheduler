@@ -2,45 +2,48 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-from typing import List, Sequence
+import warnings
+from dataclasses import dataclass, field
+from typing import List, Optional, Sequence
 
 import torch
 
-from .compat import allow_quantized_training_in_trainer
+
+# ---------------------------------------------------------------------------
+# BitNet detection helpers
+# ---------------------------------------------------------------------------
+
+def _get_quantization_method_name(model: torch.nn.Module) -> str | None:
+    """Return the string name of the quantization method if present."""
+    qm = getattr(model, "quantization_method", None)
+    if qm is None:
+        return None
+    # Can be a string or a QuantizationMethod enum
+    name = str(qm).upper()
+    # Normalise: transformers uses QuantizationMethod.BITNET which str()'s to 'bitnet'
+    return name.split(".")[-1]  # e.g. 'BITNET', 'BITS_AND_BYTES', etc.
 
 
-@dataclass
-class ModelPrepConfig:
-    auto_lora_for_quantized: bool = True
-    lora_r: int = 16
-    lora_alpha: int = 32
-    lora_dropout: float = 0.05
-    lora_bias: str = "none"
-    lora_target_modules: Sequence[str] | None = None
-    try_dequantize_if_available: bool = True
-    allow_trainer_quantization_bypass: bool = True
-    verbose: bool = True
+def is_bitnet_model(model: torch.nn.Module) -> bool:
+    """Return True if the model is a native BitNet quantized checkpoint.
 
+    This is the case when transformers sets quantization_method = BITNET
+    (i.e. the model was loaded from the packed ternary checkpoint, not the
+    pre-quantized bfloat16 revision).  Training this directly is blocked by
+    transformers' validate_quantization_for_training().
+    """
+    method = _get_quantization_method_name(model)
+    if method is not None and "BITNET" in method:
+        return True
 
-@dataclass
-class ModelPrepReport:
-    quantized_detected: bool
-    auto_lora_applied: bool
-    dequantized: bool
-    trainer_quantization_bypass_applied: bool
-    lora_target_modules: List[str]
-    notes: List[str]
+    # Fallback: scan for BitLinear layers (class name contains 'bitlinear' or
+    # 'bitnet') — present when loaded via the default revision.
+    for _, module in model.named_modules():
+        cls = module.__class__.__name__.lower()
+        if "bitlinear" in cls or ("bitnet" in cls and "linear" in cls):
+            return True
 
-    def to_dict(self):
-        return {
-            "quantized_detected": bool(self.quantized_detected),
-            "auto_lora_applied": bool(self.auto_lora_applied),
-            "dequantized": bool(self.dequantized),
-            "trainer_quantization_bypass_applied": bool(self.trainer_quantization_bypass_applied),
-            "lora_target_modules": list(self.lora_target_modules),
-            "notes": list(self.notes),
-        }
+    return False
 
 
 def is_quantized_model(model: torch.nn.Module) -> bool:
@@ -50,6 +53,43 @@ def is_quantized_model(model: torch.nn.Module) -> bool:
         or getattr(model, "quantization_method", None) is not None
     )
 
+
+# ---------------------------------------------------------------------------
+# Dataclasses
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ModelPrepConfig:
+    auto_lora_for_quantized: bool = True
+    lora_r: int = 16
+    lora_alpha: int = 32
+    lora_dropout: float = 0.05
+    lora_bias: str = "none"
+    lora_target_modules: Sequence[str] | None = None
+    verbose: bool = True
+
+
+@dataclass
+class ModelPrepReport:
+    quantized_detected: bool
+    bitnet_detected: bool
+    bitnet_path: Optional[str]   # hint for the user on how to reload
+    auto_lora_applied: bool
+    lora_target_modules: List[str]
+
+    def to_dict(self):
+        return {
+            "quantized_detected": bool(self.quantized_detected),
+            "bitnet_detected": bool(self.bitnet_detected),
+            "bitnet_path": self.bitnet_path,
+            "auto_lora_applied": bool(self.auto_lora_applied),
+            "lora_target_modules": list(self.lora_target_modules),
+        }
+
+
+# ---------------------------------------------------------------------------
+# LoRA target inference
+# ---------------------------------------------------------------------------
 
 def infer_lora_target_modules(model: torch.nn.Module, preferred: Sequence[str] | None = None) -> List[str]:
     preferred = list(
@@ -71,29 +111,34 @@ def infer_lora_target_modules(model: torch.nn.Module, preferred: Sequence[str] |
         )
     )
 
-    supported_leaf_names: set[str] = set()
-
-    supported_types = [torch.nn.Linear, torch.nn.Embedding, torch.nn.Conv1d, torch.nn.Conv2d, torch.nn.Conv3d]
-    try:
-        from transformers.pytorch_utils import Conv1D as HFConv1D  # type: ignore
-
-        supported_types.append(HFConv1D)
-    except Exception:
-        pass
-    supported_tuple = tuple(supported_types)
-
+    linear_like_leaf_names: set[str] = set()
     for name, module in model.named_modules():
         if not name:
             continue
         leaf = name.split(".")[-1]
-        if isinstance(module, supported_tuple):
-            supported_leaf_names.add(leaf)
+        cls = module.__class__.__name__.lower()
+        # Skip BitLinear — these are not trainable via LoRA in the native
+        # BitNet checkpoint.  Only real nn.Linear layers can be targeted.
+        if "bitlinear" in cls or ("bitnet" in cls and "linear" in cls):
+            continue
+        if isinstance(module, torch.nn.Linear):
+            linear_like_leaf_names.add(leaf)
+            continue
+        weight = getattr(module, "weight", None)
+        if isinstance(weight, torch.Tensor) and weight.ndim == 2:
+            if "norm" in cls or "embed" in cls:
+                continue
+            linear_like_leaf_names.add(leaf)
 
-    selected = [name for name in preferred if name in supported_leaf_names]
+    selected = [name for name in preferred if name in linear_like_leaf_names]
     if selected:
         return selected
-    return sorted(supported_leaf_names)
+    return sorted(linear_like_leaf_names)
 
+
+# ---------------------------------------------------------------------------
+# Model resolver
+# ---------------------------------------------------------------------------
 
 def resolve_scheduler_model(model: torch.nn.Module) -> torch.nn.Module:
     if hasattr(model, "get_base_model"):
@@ -106,40 +151,96 @@ def resolve_scheduler_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-def _set_attr_best_effort(obj: object, name: str, value, notes: List[str]):
+# ---------------------------------------------------------------------------
+# BitNet reload helper
+# ---------------------------------------------------------------------------
+
+_BITNET_PREQUANTIZED_HINT = """
+  The model you loaded is a native BitNet checkpoint (packed ternary weights).
+  transformers blocks training on this revision.
+
+  For Falcon-E and Microsoft BitNet series models, load the pre-quantized
+  bfloat16 revision instead and use onebitllms to inject trainable BitLinear
+  layers:
+
+      pip install onebitllms
+
+      from transformers import AutoModelForCausalLM, AutoTokenizer
+      from onebitllms import replace_linear_with_bitnet_linear
+
+      tokenizer = AutoTokenizer.from_pretrained(model_id, revision="prequantized")
+      model = AutoModelForCausalLM.from_pretrained(
+          model_id,
+          revision="prequantized",
+          torch_dtype=torch.bfloat16,
+          device_map="auto",
+      )
+      model = replace_linear_with_bitnet_linear(model)
+      # Now pass model to DeepChaosScheduler and your trainer as normal.
+      # After training, quantize back with:
+      #   from onebitllms import quantize_to_1bit
+      #   quantize_to_1bit(output_dir, quantized_output_dir)
+"""
+
+
+def apply_bitnet_linear_replacement(model: torch.nn.Module, verbose: bool = True) -> torch.nn.Module:
+    """Replace linear layers with trainable BitLinear layers via onebitllms.
+
+    Call this AFTER loading with revision="prequantized" and BEFORE passing
+    the model to DeepChaosScheduler or any trainer.
+
+    Raises RuntimeError if onebitllms is not installed.
+    """
     try:
-        setattr(obj, name, value)
-    except Exception as exc:
-        notes.append(f"setattr_failed:{type(obj).__name__}.{name}:{exc}")
+        from onebitllms import replace_linear_with_bitnet_linear  # type: ignore[import]
+    except ImportError as exc:
+        raise RuntimeError(
+            "onebitllms is required for BitNet fine-tuning. "
+            "Install with: pip install onebitllms"
+        ) from exc
+
+    model = replace_linear_with_bitnet_linear(model)
+    if verbose:
+        print("[lucky_pick_scheduler] BitLinear replacement applied (onebitllms).")
+    return model
 
 
-def _clear_quantization_training_flags(model: torch.nn.Module, notes: List[str]) -> bool:
-    touched = False
-    for obj in (model, resolve_scheduler_model(model)):
-        for name, value in (
-            ("is_quantized", False),
-            ("quantization_method", None),
-            ("hf_quantizer", None),
-        ):
-            before = getattr(obj, name, None)
-            _set_attr_best_effort(obj, name, value, notes)
-            after = getattr(obj, name, None)
-            if before is not after:
-                touched = True
-    return touched
-
+# ---------------------------------------------------------------------------
+# Main entry point
+# ---------------------------------------------------------------------------
 
 def prepare_model_for_training(
     model: torch.nn.Module,
     config: ModelPrepConfig | None = None,
 ) -> tuple[torch.nn.Module, ModelPrepReport]:
     cfg = config or ModelPrepConfig()
+
+    bitnet = is_bitnet_model(model)
     quantized = is_quantized_model(model)
     auto_lora_applied = False
-    dequantized = False
-    trainer_quantization_bypass_applied = False
     lora_target_modules: List[str] = []
-    notes: List[str] = []
+    bitnet_path: Optional[str] = None
+
+    if bitnet:
+        # Native BitNet checkpoint — transformers will hard-block the Trainer.
+        # We cannot fix this at prepare time without reloading the model from
+        # a different revision, which prepare_model_for_training can't do.
+        # Emit a clear error with the exact steps to fix it.
+        model_id = getattr(getattr(model, "config", None), "_name_or_path", None)
+        if model_id:
+            bitnet_path = f"{model_id} (revision='prequantized')"
+        warnings.warn(
+            f"\n\n[lucky_pick_scheduler] BitNet model detected.\n"
+            f"{_BITNET_PREQUANTIZED_HINT}",
+            UserWarning,
+            stacklevel=2,
+        )
+        raise RuntimeError(
+            "Cannot prepare a native BitNet checkpoint for training. "
+            "Load with revision='prequantized' and call "
+            "apply_bitnet_linear_replacement(model) before training. "
+            "See the warning above for the full steps."
+        )
 
     if quantized and bool(cfg.auto_lora_for_quantized):
         try:
@@ -150,65 +251,33 @@ def prepare_model_for_training(
             ) from exc
 
         lora_target_modules = list(cfg.lora_target_modules or infer_lora_target_modules(model))
-        if lora_target_modules:
-            lora_cfg = LoraConfig(
-                task_type=TaskType.CAUSAL_LM,
-                r=int(cfg.lora_r),
-                lora_alpha=int(cfg.lora_alpha),
-                lora_dropout=float(cfg.lora_dropout),
-                bias=str(cfg.lora_bias),
-                target_modules=lora_target_modules,
+        if not lora_target_modules:
+            raise RuntimeError(
+                "Quantized model detected but no linear target modules were found for LoRA adapters."
             )
-            try:
-                model = get_peft_model(model, lora_cfg)
-                auto_lora_applied = True
-                if cfg.verbose:
-                    print(
-                        "Auto-LoRA applied for quantized model. "
-                        f"targets={lora_target_modules}"
-                    )
-                    if hasattr(model, "print_trainable_parameters"):
-                        model.print_trainable_parameters()
-            except Exception as exc:
-                notes.append(f"auto_lora_failed:{exc}")
-                if cfg.verbose:
-                    print(f"Auto-LoRA injection failed for quantized model: {exc}")
-        else:
-            notes.append("no_supported_lora_target_modules")
-            if cfg.verbose:
-                print("No PEFT-supported target modules found for quantized model; skipping auto-LoRA.")
-
-    if quantized and not auto_lora_applied and bool(cfg.try_dequantize_if_available) and hasattr(model, "dequantize"):
-        try:
-            maybe_model = model.dequantize()  # some APIs mutate in place and return None
-            if isinstance(maybe_model, torch.nn.Module):
-                model = maybe_model
-            quantized = is_quantized_model(model)
-            dequantized = not quantized
-            if dequantized:
-                notes.append("dequantized_model")
-                if cfg.verbose:
-                    print("Dequantized model for training compatibility.")
-        except Exception as exc:
-            notes.append(f"dequantize_failed:{exc}")
-            if cfg.verbose:
-                print(f"Dequantize attempt failed: {exc}")
-
-    if quantized and not auto_lora_applied and bool(cfg.allow_trainer_quantization_bypass):
-        patched = allow_quantized_training_in_trainer(verbose=cfg.verbose)
-        trainer_quantization_bypass_applied = len(patched) > 0
-        if trainer_quantization_bypass_applied:
-            notes.append("trainer_quantization_validation_bypassed")
-        if _clear_quantization_training_flags(model, notes):
-            notes.append("quantization_flags_cleared_for_trainer")
-        quantized = is_quantized_model(model)
+        lora_cfg = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=int(cfg.lora_r),
+            lora_alpha=int(cfg.lora_alpha),
+            lora_dropout=float(cfg.lora_dropout),
+            bias=str(cfg.lora_bias),
+            target_modules=lora_target_modules,
+        )
+        model = get_peft_model(model, lora_cfg)
+        auto_lora_applied = True
+        if cfg.verbose:
+            print(
+                "Auto-LoRA applied for quantized model. "
+                f"targets={lora_target_modules}"
+            )
+            if hasattr(model, "print_trainable_parameters"):
+                model.print_trainable_parameters()
 
     report = ModelPrepReport(
         quantized_detected=bool(quantized),
+        bitnet_detected=bool(bitnet),
+        bitnet_path=bitnet_path,
         auto_lora_applied=bool(auto_lora_applied),
-        dequantized=bool(dequantized),
-        trainer_quantization_bypass_applied=bool(trainer_quantization_bypass_applied),
         lora_target_modules=lora_target_modules,
-        notes=notes,
     )
     return model, report
