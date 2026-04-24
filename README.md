@@ -12,6 +12,17 @@ Dependencies: `torch`, `transformers`, `wandb`. Optional: `peft` (required for q
 
 ---
 
+## What Makes It Generic
+
+The scheduler stays model-family agnostic through four design choices:
+
+1. **Layer auto-discovery**: uses structural inference (`resolve_transformer_layers`) instead of hardcoded model maps.
+2. **Projection-hook masking**: modifies projection outputs with hooks instead of replacing forward methods.
+3. **KV-share awareness**: detects shared K/V regimes and avoids invalid hook placements on shared pathways.
+4. **Post-proj norm awareness**: supports architectures where normalization and projection ordering differs from Llama-like defaults.
+
+---
+
 ## How the Scheduler Works
 
 `DeepChaosScheduler` runs a **sticky-block topology lottery** across your model's transformer layers on every training step.
@@ -46,27 +57,22 @@ Sacred and victim ranges are computed from `num_hidden_layers`. If the model has
 
 The scheduler auto-config path was tested across the following checkpoints:
 
-| Model | Size / Type | Scheduler Auto-Config |
-|---|---|---|
-| Qwen 2.5 3B Instruct | 3B | ✅ |
-| Falcon-E 3B Instruct | 3B | ✅ |
-| SmolLM2-360M | 360M Tiny | ✅ |
-| Ministral 3 3B Instruct 2512 | 3B | ✅ |
-| Doge-320M | 320M Tiny | ✅ |
-| Llama 3.2 3B | 3B | ✅ |
-| Gemma-4-E4B | ~4B (efficient) | ✅ |
-| Phi-4-mini-instruct | Mini | ✅ |
-| OLMo-2-0425-1B | 1B | ✅ |
-| Phi-tiny-MoE-instruct | Tiny MoE | ✅ |
+| Model | Size / Type | Scheduler Auto-Config | Limitation / Caveat |
+|---|---|---|---|
+| Qwen 2.5 3B Instruct | 3B | ✅ | None observed |
+| Falcon-E 3B Instruct | 3B | ✅ | Use `prequantized` revision for training |
+| SmolLM2-360M | 360M Tiny | ✅ | None observed |
+| Ministral 3 3B Instruct 2512 | 3B | ✅ | `fix_mistral_regex=True` tokenizer compat may be required |
+| Doge-320M | 320M Tiny | ✅ | Remote-code revisions can require compat patching |
+| Llama 3.2 3B | 3B | ✅ | None observed |
+| Gemma-4-E4B | ~4B (efficient) | ✅ | Text-only path may require `attn_implementation=\"eager\"` and explicit CUDA move |
+| Phi-4-mini-instruct | Mini | ✅ | Prefer native HF load (`trust_remote_code=False`) |
+| OLMo-2-0425-1B | 1B | ✅ | None observed |
+| Phi-tiny-MoE-instruct | Tiny MoE | ✅ | Prefer fp32 training precision for grouped MoE dtype consistency |
 
 ## Compatibility & Limitations
 
 The scheduler was tested on the architectures above, and layer discovery / sacred-victim auto-configuration worked without manual layer mapping, including MoE models.
-
-Notes from real-world runs:
-- `microsoft/Phi-*` models are loaded through native `transformers` classes (`trust_remote_code=False`) to avoid dynamic-module API skew.
-- `microsoft/Phi-tiny-MoE-instruct` may require fp32 training precision to avoid grouped MoE matmul dtype mismatches (`float` vs `bfloat16`).
-- `google/gemma-4-*` text-only finetuning paths may need operating on the language submodule with explicit device placement (`device_map=None` at load + manual `.to("cuda")`).
 
 No permanently unsupported model family is currently known, but highly custom remote-code checkpoints can still require model-specific loader flags.
 
@@ -249,11 +255,31 @@ trainer = SFTTrainer(
 trainer.train()
 ```
 
-> **Note on gradient checkpointing:** if you use `gradient_checkpointing=True`, keep `sticky_interval >= gradient_accumulation_steps`. If the topology reshuffles in the middle of a gradient accumulation window, the recomputed forward during the backward pass sees a different topology than the original forward, which produces incorrect gradients.
-
 ### Using with Axolotl or any other trainer
 
 The pattern is the same — load your model, initialize `DeepChaosScheduler`, plug in a callback or hook that calls `dc.step(global_step)` before each forward pass. The scheduler doesn't care how the model was loaded or what trainer wraps it.
+
+---
+
+## Known Pitfalls
+
+- If you use `gradient_checkpointing=True`, keep `sticky_interval >= gradient_accumulation_steps`. If the topology reshuffles in the middle of an accumulation window, backward recomputation can see a different topology than forward, producing incorrect gradients.
+
+- **`CUDA error: an illegal memory access` inside `clip_grad_norm_` on A100.** Traceback lands in `torch._foreach_norm(device_grads, norm_type)`, usually with `XID 31 ... MMU Fault ... FAULT_PDE ACCESS_TYPE_VIRT_READ` in the NVIDIA log. Not a NaN/Inf bug — grads are clean. The fused `_foreach_norm` kernel trips a PDE MMU fault on some A100 + CUDA 12.1 + PyTorch 2.5.1 combos (reproduced on Modal A100-80GB with Gemma-4 E4B). Fix by forcing the single-tensor loop:
+
+  ```python
+  from lucky_pick_scheduler import patch_clip_grad_norm_disable_foreach
+  patch_clip_grad_norm_disable_foreach()
+  # then construct your Trainer / run trainer.train() as usual
+  ```
+
+  Idempotent. Also patches the `accelerate.accelerator` reference that HF `Trainer` delegates to.
+
+- **Gemma-4 multimodal + `device_map="auto"` + extracting `.language_model`.** Gemma-4 (`Gemma3ForConditionalGeneration`) wraps `vision_tower`, `multi_modal_projector`, and `language_model`. `device_map="auto"` installs Accelerate `AlignDevicesHook` dispatch metadata on the parent wrapper's params; extracting `.language_model` for training leaves that stale metadata on the vision-side params. `Trainer` still iterates them via `model.parameters()`, and any foreach kernel over the full list PDE-faults. Load with `device_map=None`, drop the vision half, then `.to("cuda")` manually — `model_load_kwargs_for_training(model_name, dtype)` does this for you on Gemma-4 names.
+
+- **Debugging async CUDA faults.** The default async CUDA dispatcher surfaces errors at the next sync op, which may be far from the real faulting kernel. For any `illegal memory access` chase, set `CUDA_LAUNCH_BLOCKING=1` in the container env so the traceback points at the real line.
+
+- **Modal image layer caches a stale scheduler SHA.** `modal.Image.run_commands(...)` hashes the command string for caching. If a pip-install-from-git refuses to update after you push a new SHA, bust the cache with an explicit token in the command string: `"echo 'lps-rev=<date>-<sha>' && pip install ... @<sha>"`. Bump the token whenever you push.
 
 ---
 
@@ -363,7 +389,7 @@ quantize_to_1bit(output_dir, quantized_output_dir)
 
 Requires `pip install onebitllms`. LoRA/PEFT is not currently supported for BitNet models — `apply_bitnet_linear_replacement` does full-parameter QAT using a straight-through estimator.
 
-> **Container/Modal note:** `pip install git+https://...` in a container image is cached at build time. If you push changes to this repo and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git`
+> **Container note:** `pip install git+https://...` in a container image is cached at build time. If you push changes to this repo and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git`
 
 ---
 

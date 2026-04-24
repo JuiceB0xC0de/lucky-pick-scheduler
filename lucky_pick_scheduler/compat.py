@@ -164,3 +164,66 @@ def allow_quantized_training_in_trainer(*, verbose: bool = True) -> List[str]:
         print("[lucky_pick_scheduler.compat] Trainer validation already patched (idempotent).")
 
     return applied
+
+
+def patch_clip_grad_norm_disable_foreach(*, verbose: bool = True) -> bool:
+    """Force ``torch.nn.utils.clip_grad_norm_`` to run with ``foreach=False``.
+
+    Background: on some CUDA / driver / A100 combinations,
+    ``torch._foreach_norm`` (the fused kernel used by the default grad-clip
+    path) trips an XID 31 PDE MMU fault partway through training — surfacing
+    as ``RuntimeError: CUDA error: an illegal memory access was encountered``
+    inside ``clip_grad_norm_``. The single-tensor loop (foreach=False) is
+    slightly slower but has been stable across the versions we've tested.
+
+    Observed on: Gemma-4 (E4B), A100-80GB, torch 2.5.1 + CUDA 12.1.
+    Trigger: ``trainer.train()`` crashes in ``_foreach_norm(device_grads, ...)``
+    on one of the first few optimizer steps, not necessarily step 0.
+
+    This patch is idempotent and also patches the reference held by
+    ``accelerate.accelerator`` (which imports ``torch.nn.utils`` at module
+    load time), since HuggingFace ``Trainer.clip_grad_norm_`` delegates to
+    ``self.accelerator.clip_grad_norm_``.
+
+    Returns True if the patch was applied this call, False if it was already
+    applied.
+    """
+    import torch
+
+    if getattr(torch.nn.utils.clip_grad_norm_, "_lps_disabled_foreach", False):
+        if verbose:
+            print("[lucky_pick_scheduler.compat] clip_grad_norm_ foreach already disabled.")
+        return False
+
+    _orig = torch.nn.utils.clip_grad_norm_
+
+    def _clip_grad_norm_no_foreach(parameters, max_norm, norm_type=2.0,
+                                   error_if_nonfinite=False, foreach=None):
+        return _orig(
+            parameters,
+            max_norm,
+            norm_type=norm_type,
+            error_if_nonfinite=error_if_nonfinite,
+            foreach=False,
+        )
+
+    _clip_grad_norm_no_foreach._lps_disabled_foreach = True  # type: ignore[attr-defined]
+    _clip_grad_norm_no_foreach._lps_orig = _orig  # type: ignore[attr-defined]
+
+    torch.nn.utils.clip_grad_norm_ = _clip_grad_norm_no_foreach
+
+    # Accelerate imports the symbol at module-load time, so patching
+    # torch.nn.utils alone doesn't cover Trainer -> accelerator.clip_grad_norm_.
+    try:
+        import accelerate.accelerator as _accel_mod
+        _accel_mod.torch.nn.utils.clip_grad_norm_ = _clip_grad_norm_no_foreach
+    except Exception as exc:
+        if verbose:
+            print(f"[lucky_pick_scheduler.compat] accelerate patch skipped: {exc}")
+
+    if verbose:
+        print(
+            "[lucky_pick_scheduler.compat] Patched clip_grad_norm_ -> foreach=False "
+            "(A100 _foreach_norm XID-31 workaround)."
+        )
+    return True
