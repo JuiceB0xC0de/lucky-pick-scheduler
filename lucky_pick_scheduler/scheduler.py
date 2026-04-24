@@ -1,17 +1,16 @@
-"""Auto-configured optimizer + LR scheduler builder for transformer finetuning."""
+"""Auto-configured optimizer + LR scheduler builder for transformer finetuning.
+
+AdamW only. Introspects the model, groups parameters by role (attention, MLP,
+embedding, head, norm/bias), and builds a single AdamW optimizer + LR scheduler.
+"""
 
 from __future__ import annotations
 
 from dataclasses import dataclass, asdict
-from typing import Any, Dict, Iterable, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 import torch
 from transformers import get_scheduler
-
-try:
-    import torch.distributed as dist
-except Exception:  # pragma: no cover - optional distributed runtime
-    dist = None  # type: ignore[assignment]
 
 
 ROLE_ORDER = (
@@ -49,29 +48,34 @@ class AutoSchedulerConfig:
     warmup_steps: int | None = None
     adam_betas: Tuple[float, float] = (0.9, 0.95)
     adam_eps: float = 1e-10
-    prefer_muon: bool = True
-    muon_lr_multiplier: float = 1.0
-    muon_momentum: float = 0.95
-    muon_weight_decay: float | None = None
-    min_muon_ndim: int = 2
+    # Per-role LR multipliers. The matrix group (attention/mlp/other_matrix
+    # parameters with ndim >= matrix_ndim) uses `matrix_lr_multiplier * learning_rate`,
+    # everything else uses the base learning_rate. Defaults keep both groups at the
+    # same LR — set matrix_lr_multiplier > 1.0 if you want matrix params trained hotter.
+    matrix_lr_multiplier: float = 1.0
+    matrix_ndim: int = 2
+    # When True, norm/bias params (ndim < 2 or matched by NORM_TOKENS) get
+    # weight_decay=0.0 instead of cfg.weight_decay. This is the standard AdamW
+    # recipe for transformer training.
+    no_decay_on_norm_bias: bool = True
 
 
 @dataclass
 class SchedulerBuildReport:
     optimizer_name: str
     scheduler_name: str
-    used_muon: bool
     num_training_steps: int
     num_warmup_steps: int
     model_profile: ModelProfile
     role_param_counts: Dict[str, int]
     role_numel_counts: Dict[str, int]
-    muon_param_count: int
-    adam_param_count: int
-    muon_numel: int
-    adam_numel: int
+    matrix_param_count: int
+    scalar_param_count: int
+    no_decay_param_count: int
+    matrix_numel: int
+    scalar_numel: int
+    no_decay_numel: int
     skipped_param_count: int
-    fallback_reason: str | None = None
 
     def to_dict(self) -> Dict[str, Any]:
         payload = asdict(self)
@@ -167,77 +171,6 @@ def classify_model_parameters(model: torch.nn.Module) -> List[Dict[str, Any]]:
     return rows
 
 
-def _is_distributed_ready() -> bool:
-    if dist is None:
-        return False
-    try:
-        return bool(dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1)
-    except Exception:
-        return False
-
-
-def _build_muon_optimizer(
-    muon_params: List[torch.nn.Parameter],
-    adam_params: List[torch.nn.Parameter],
-    cfg: AutoSchedulerConfig,
-):
-    from muon import MuonWithAuxAdam, SingleDeviceMuonWithAuxAdam  # type: ignore[import-not-found]
-
-    muon_lr = cfg.learning_rate * cfg.muon_lr_multiplier
-    muon_wd = cfg.weight_decay if cfg.muon_weight_decay is None else cfg.muon_weight_decay
-    groups = []
-    if muon_params:
-        groups.append(
-            {
-                "params": muon_params,
-                "use_muon": True,
-                "lr": muon_lr,
-                "momentum": cfg.muon_momentum,
-                "weight_decay": muon_wd,
-            }
-        )
-    if adam_params:
-        groups.append(
-            {
-                "params": adam_params,
-                "use_muon": False,
-                "lr": cfg.learning_rate,
-                "betas": cfg.adam_betas,
-                "eps": cfg.adam_eps,
-                "weight_decay": cfg.weight_decay,
-            }
-        )
-    if not groups:
-        raise ValueError("No trainable parameters found for Muon/Adam setup.")
-
-    if _is_distributed_ready():
-        return MuonWithAuxAdam(groups), "MuonWithAuxAdam"
-    return SingleDeviceMuonWithAuxAdam(groups), "SingleDeviceMuonWithAuxAdam"
-
-
-def _build_adamw_optimizer(
-    muon_like_params: List[torch.nn.Parameter],
-    adam_params: List[torch.nn.Parameter],
-    cfg: AutoSchedulerConfig,
-):
-    muon_lr = cfg.learning_rate * cfg.muon_lr_multiplier
-    param_groups = []
-    if muon_like_params:
-        param_groups.append({"params": muon_like_params, "lr": muon_lr, "weight_decay": cfg.weight_decay})
-    if adam_params:
-        param_groups.append({"params": adam_params, "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay})
-    if not param_groups:
-        raise ValueError("No trainable parameters found for AdamW setup.")
-    optimizer = torch.optim.AdamW(
-        param_groups,
-        lr=cfg.learning_rate,
-        betas=cfg.adam_betas,
-        eps=cfg.adam_eps,
-        weight_decay=cfg.weight_decay,
-    )
-    return optimizer, "AdamW"
-
-
 def _warmup_steps(cfg: AutoSchedulerConfig, total_steps: int) -> int:
     if total_steps <= 0:
         raise ValueError("num_training_steps must be > 0")
@@ -251,13 +184,24 @@ def build_scheduler_stack(
     num_training_steps: int,
     config: AutoSchedulerConfig | None = None,
 ):
-    """Build optimizer + lr scheduler from a loaded model using role-based auto grouping."""
+    """Build an AdamW optimizer + LR scheduler using role-based parameter groups.
+
+    Parameters are split into three groups:
+      - matrix params (attention/mlp/other_matrix with ndim >= cfg.matrix_ndim):
+        lr = cfg.learning_rate * cfg.matrix_lr_multiplier, weight_decay = cfg.weight_decay
+      - scalar/misc params (embedding, head, other_scalar, or ndim < matrix_ndim
+        not matching norm/bias): lr = cfg.learning_rate, weight_decay = cfg.weight_decay
+      - no-decay params (norm_bias role, when cfg.no_decay_on_norm_bias is True):
+        lr = cfg.learning_rate, weight_decay = 0.0
+    """
     cfg = config or AutoSchedulerConfig()
     rows = classify_model_parameters(model)
     profile = infer_model_profile(model)
 
-    muon_candidates: List[torch.nn.Parameter] = []
-    adam_candidates: List[torch.nn.Parameter] = []
+    matrix_params: List[torch.nn.Parameter] = []
+    scalar_params: List[torch.nn.Parameter] = []
+    no_decay_params: List[torch.nn.Parameter] = []
+
     role_param_counts: Dict[str, int] = {role: 0 for role in ROLE_ORDER}
     role_numel_counts: Dict[str, int] = {role: 0 for role in ROLE_ORDER}
     skipped_param_count = 0
@@ -274,27 +218,38 @@ def build_scheduler_stack(
             skipped_param_count += 1
             continue
 
-        muon_eligible = (
-            cfg.prefer_muon
-            and row["ndim"] >= cfg.min_muon_ndim
+        is_no_decay = bool(cfg.no_decay_on_norm_bias) and role == "norm_bias"
+        is_matrix = (
+            row["ndim"] >= cfg.matrix_ndim
             and role in {"attention", "mlp", "other_matrix"}
         )
-        if muon_eligible:
-            muon_candidates.append(param)
-        else:
-            adam_candidates.append(param)
 
-    used_muon = False
-    fallback_reason = None
-    try:
-        if cfg.prefer_muon and muon_candidates:
-            optimizer, optimizer_name = _build_muon_optimizer(muon_candidates, adam_candidates, cfg)
-            used_muon = True
+        if is_no_decay:
+            no_decay_params.append(param)
+        elif is_matrix:
+            matrix_params.append(param)
         else:
-            optimizer, optimizer_name = _build_adamw_optimizer(muon_candidates, adam_candidates, cfg)
-    except Exception as exc:
-        fallback_reason = str(exc)
-        optimizer, optimizer_name = _build_adamw_optimizer(muon_candidates, adam_candidates, cfg)
+            scalar_params.append(param)
+
+    matrix_lr = cfg.learning_rate * cfg.matrix_lr_multiplier
+
+    param_groups = []
+    if matrix_params:
+        param_groups.append({"params": matrix_params, "lr": matrix_lr, "weight_decay": cfg.weight_decay})
+    if scalar_params:
+        param_groups.append({"params": scalar_params, "lr": cfg.learning_rate, "weight_decay": cfg.weight_decay})
+    if no_decay_params:
+        param_groups.append({"params": no_decay_params, "lr": cfg.learning_rate, "weight_decay": 0.0})
+    if not param_groups:
+        raise ValueError("No trainable parameters found for AdamW setup.")
+
+    optimizer = torch.optim.AdamW(
+        param_groups,
+        lr=cfg.learning_rate,
+        betas=cfg.adam_betas,
+        eps=cfg.adam_eps,
+        weight_decay=cfg.weight_decay,
+    )
 
     warmup_steps = _warmup_steps(cfg, num_training_steps)
     scheduler = get_scheduler(
@@ -304,23 +259,23 @@ def build_scheduler_stack(
         num_training_steps=num_training_steps,
     )
 
-    muon_numel = sum(int(p.numel()) for p in muon_candidates)
-    adam_numel = sum(int(p.numel()) for p in adam_candidates)
+    matrix_numel = sum(int(p.numel()) for p in matrix_params)
+    scalar_numel = sum(int(p.numel()) for p in scalar_params)
+    no_decay_numel = sum(int(p.numel()) for p in no_decay_params)
     report = SchedulerBuildReport(
-        optimizer_name=optimizer_name,
+        optimizer_name="AdamW",
         scheduler_name=cfg.lr_scheduler_type,
-        used_muon=used_muon,
         num_training_steps=int(num_training_steps),
         num_warmup_steps=warmup_steps,
         model_profile=profile,
         role_param_counts=role_param_counts,
         role_numel_counts=role_numel_counts,
-        muon_param_count=len(muon_candidates),
-        adam_param_count=len(adam_candidates),
-        muon_numel=muon_numel,
-        adam_numel=adam_numel,
+        matrix_param_count=len(matrix_params),
+        scalar_param_count=len(scalar_params),
+        no_decay_param_count=len(no_decay_params),
+        matrix_numel=matrix_numel,
+        scalar_numel=scalar_numel,
+        no_decay_numel=no_decay_numel,
         skipped_param_count=skipped_param_count,
-        fallback_reason=fallback_reason,
     )
     return optimizer, scheduler, report
-

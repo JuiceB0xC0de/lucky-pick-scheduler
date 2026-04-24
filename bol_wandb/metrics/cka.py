@@ -1,46 +1,44 @@
-import torch
+from __future__ import annotations
+
 import numpy as np
+import torch
 import wandb
 
 from ..config import CLUSTER_WORDS
+from .common import resolve_layer_count
+
 
 def centering_matrix(n):
     return np.eye(n) - np.ones((n, n)) / n
 
-def linear_kernel(X):
-    return X @ X.T
 
-def hsic(K, L, H):
-    n = K.shape[0]
-    return np.trace(H @ K @ H @ L) / ((n - 1) ** 2)
+def linear_kernel(x):
+    return x @ x.T
 
-def linear_cka(X, Y):
-    n = X.shape[0]
-    H = centering_matrix(n)
-    K = linear_kernel(X)
-    L = linear_kernel(Y)
 
-    hsic_kl = hsic(K, L, H)
-    hsic_kk = hsic(K, K, H)
-    hsic_ll = hsic(L, L, H)
+def hsic(k, l, h):
+    n = k.shape[0]
+    return np.trace(h @ k @ h @ l) / ((n - 1) ** 2)
 
+
+def linear_cka(x, y):
+    n = x.shape[0]
+    h = centering_matrix(n)
+    k = linear_kernel(x)
+    l = linear_kernel(y)
+    hsic_kl = hsic(k, l, h)
+    hsic_kk = hsic(k, k, h)
+    hsic_ll = hsic(l, l, h)
     denom = np.sqrt(hsic_kk * hsic_ll)
     if denom < 1e-10:
         return 0.0
     return hsic_kl / denom
 
+
 def run_cka(model: torch.nn.Module, tokenizer) -> wandb.Table:
-    """
-    Computes Centered Kernel Alignment (CKA) between layers to measure 
-    representation similarity. Returns a wandb.Table for heatmap visualization.
-    """
     device = next(model.parameters()).device
     model.eval()
-    
-    if hasattr(model.config, 'num_hidden_layers'):
-        N = model.config.num_hidden_layers
-    else:
-        N = len([n for n, _ in model.named_parameters() if 'layers.' in n and 'weight' in n]) // 4
+    num_layers = resolve_layer_count(model)
 
     def get_hidden(word, layer_idx):
         inputs = tokenizer(word, return_tensors="pt")
@@ -50,23 +48,21 @@ def run_cka(model: torch.nn.Module, tokenizer) -> wandb.Table:
         hidden = outputs.hidden_states[layer_idx]
         return hidden.mean(dim=1).squeeze().cpu().float().numpy()
 
-    # Sample layers to avoid massive O(N^2) compute if N is large
-    SAMPLE_LAYERS = list(range(0, N + 1, max(1, N // 10)))
-    if N not in SAMPLE_LAYERS:
-        SAMPLE_LAYERS.append(N)
-    SAMPLE_LAYERS = sorted(set(SAMPLE_LAYERS))
+    sample_layers = list(range(0, num_layers + 1, max(1, num_layers // 10)))
+    if num_layers not in sample_layers:
+        sample_layers.append(num_layers)
+    sample_layers = sorted(set(sample_layers))
 
     rep_matrices = {}
-    for layer in SAMPLE_LAYERS:
+    for layer in sample_layers:
         vecs = [get_hidden(w, layer) for w in CLUSTER_WORDS]
         rep_matrices[layer] = np.stack(vecs)
 
     columns = ["Layer_X", "Layer_Y", "CKA_Score"]
     data = []
-    
-    for li in SAMPLE_LAYERS:
-        for lj in SAMPLE_LAYERS:
-            cka_val = linear_cka(rep_matrices[li], rep_matrices[lj])
-            data.append([f"L{li}", f"L{lj}", cka_val])
-            
+    for layer_i in sample_layers:
+        for layer_j in sample_layers:
+            data.append(
+                [f"L{layer_i}", f"L{layer_j}", linear_cka(rep_matrices[layer_i], rep_matrices[layer_j])]
+            )
     return wandb.Table(columns=columns, data=data)

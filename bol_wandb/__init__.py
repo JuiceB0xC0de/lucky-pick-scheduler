@@ -1,3 +1,4 @@
-from .callback import BoLWandbCallback
+from .callback import BoLPrintCallback, BoLWandbCallback
+from .scanner import BOLScanner
 
-__all__ = ['BoLWandbCallback']
+__all__ = ["BOLScanner", "BoLWandbCallback", "BoLPrintCallback"]

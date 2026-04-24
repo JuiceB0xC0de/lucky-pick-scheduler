@@ -8,7 +8,7 @@ A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre
 pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
 ```
 
-Dependencies: `torch`, `transformers`, `wandb`. Optional: `peft` (required for quantized models), `scipy` (used in silhouette scan), `muon` (optional optimizer).
+Dependencies: `torch`, `transformers`, `wandb`. Optional: `peft` (required for quantized models), `scipy` (used in silhouette scan).
 
 ---
 
@@ -409,7 +409,7 @@ apply_transformers_remote_code_compat(verbose=True)
 
 ## Auto optimizer + LR scheduler
 
-`build_scheduler_stack` introspects the model, groups parameters by role (attention, MLP, embedding, head, norm/bias), and builds an optimizer + LR scheduler automatically. It prefers Muon for attention and MLP matrices and falls back to AdamW if Muon isn't installed.
+`build_scheduler_stack` introspects the model, groups parameters by role (attention, MLP, embedding, head, norm/bias), and builds an AdamW optimizer + LR scheduler automatically. Three param groups: matrix params (attention/mlp/other_matrix weights) can run at a different LR via `matrix_lr_multiplier`, norm and bias params get `weight_decay=0.0` by default, everything else runs at the base LR.
 
 ```python
 from lucky_pick_scheduler import build_scheduler_stack, AutoSchedulerConfig
@@ -422,7 +422,8 @@ optimizer, lr_scheduler, report = build_scheduler_stack(
         weight_decay=0.01,
         lr_scheduler_type="cosine",
         warmup_ratio=0.1,
-        prefer_muon=True,
+        matrix_lr_multiplier=1.0,     # set >1.0 to train matrix params hotter
+        no_decay_on_norm_bias=True,   # standard AdamW recipe for transformers
     ),
 )
 print(report.to_dict())

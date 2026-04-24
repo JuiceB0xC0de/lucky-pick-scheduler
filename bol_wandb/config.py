@@ -1,6 +1,3 @@
-import numpy as np
-
-# ── SHARED TEST DATA ─────────────────────────────────────────────────────────
 DEFAULT_EVAL_TEXTS = [
     "The quick brown fox jumps over the lazy dog",
     "In the beginning was the word and the word was with God",
@@ -18,26 +15,51 @@ DEFAULT_PROBES = [
 ]
 
 RELATED_PAIRS = [
-    ("dog", "wolf"), ("cat", "lion"), ("river", "ocean"),
-    ("happy", "joyful"), ("cold", "frozen"), ("king", "queen"),
-    ("python", "code"), ("car", "vehicle"), ("run", "sprint"),
+    ("dog", "wolf"),
+    ("cat", "lion"),
+    ("river", "ocean"),
+    ("happy", "joyful"),
+    ("cold", "frozen"),
+    ("king", "queen"),
+    ("python", "code"),
+    ("car", "vehicle"),
+    ("run", "sprint"),
 ]
 
 UNRELATED_PAIRS = [
-    ("dog", "democracy"), ("cat", "algebra"), ("river", "justice"),
-    ("happy", "concrete"), ("cold", "philosophy"), ("king", "equation"),
-    ("python", "banana"), ("car", "silence"), ("run", "orange"),
+    ("dog", "democracy"),
+    ("cat", "algebra"),
+    ("river", "justice"),
+    ("happy", "concrete"),
+    ("cold", "philosophy"),
+    ("king", "equation"),
+    ("python", "banana"),
+    ("car", "silence"),
+    ("run", "orange"),
 ]
 
-# ── SEMANTIC PROBE CLUSTERS ──────────────────────────────────────────────────
 CLUSTER_WORDS = [
-    "dog", "wolf", "puppy",
-    "cat", "kitten", "tiger",
-    "car", "truck", "vehicle",
-    "banana", "apple", "fruit",
-    "happy", "joy", "sadness",
-    "code", "python", "programming",
-    "silence", "peace", "war",
+    "dog",
+    "wolf",
+    "puppy",
+    "cat",
+    "kitten",
+    "tiger",
+    "car",
+    "truck",
+    "vehicle",
+    "banana",
+    "apple",
+    "fruit",
+    "happy",
+    "joy",
+    "sadness",
+    "code",
+    "python",
+    "programming",
+    "silence",
+    "peace",
+    "war",
 ]
 
 CLUSTERS = {

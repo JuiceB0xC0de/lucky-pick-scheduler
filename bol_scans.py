@@ -17,6 +17,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
+from lucky_pick_scheduler import resolve_transformer_layers
 
 try:
     import wandb
@@ -216,32 +217,8 @@ def _to_device(batch: Dict[str, torch.Tensor], device: torch.device) -> Dict[str
 
 
 def _get_decoder_layers(model: torch.nn.Module) -> List[Tuple[int, str, torch.nn.Module]]:
-    candidates = [
-        ("model.layers", getattr(getattr(model, "model", None), "layers", None)),
-        (
-            "model.decoder.layers",
-            getattr(getattr(getattr(model, "model", None), "decoder", None), "layers", None),
-        ),
-        ("transformer.h", getattr(getattr(model, "transformer", None), "h", None)),
-        ("gpt_neox.layers", getattr(getattr(model, "gpt_neox", None), "layers", None)),
-        ("layers", getattr(model, "layers", None)),
-    ]
-    for base_name, layer_collection in candidates:
-        if isinstance(layer_collection, (list, torch.nn.ModuleList)) and len(layer_collection) > 0:
-            return [(idx, f"{base_name}.{idx}", layer) for idx, layer in enumerate(layer_collection)]
-
-    fallback: List[Tuple[int, str, torch.nn.Module]] = []
-    for name, module in model.named_modules():
-        if name.endswith(tuple([f".{i}" for i in range(0, 1000)])):
-            parts = name.split(".")
-            if len(parts) >= 2 and parts[-2] in {"layers", "h"}:
-                try:
-                    idx = int(parts[-1])
-                except ValueError:
-                    continue
-                fallback.append((idx, name, module))
-    fallback.sort(key=lambda x: x[0])
-    return fallback
+    layers = resolve_transformer_layers(model)
+    return [(idx, f"layers.{idx}", layer) for idx, layer in enumerate(layers)]
 
 
 def _infer_architecture(model: torch.nn.Module, layers: Sequence[Tuple[int, str, torch.nn.Module]]) -> Dict[str, Any]:
@@ -1005,6 +982,77 @@ def _try_plot_bar(table: wandb.Table, x: str, y: str, title: str):
 def _try_plot_heatmap(table: wandb.Table, x: str, y: str, value: str, title: str):
     if wandb is None:
         return None
+
+
+def format_cli_summary(results: Dict[str, Any], *, top_k: int = 5) -> str:
+    architecture = results.get("architecture", {}) or {}
+    model_type = architecture.get("model_type", "unknown")
+    hidden = architecture.get("hidden_size")
+    layers = architecture.get("num_layers")
+    heads = architecture.get("num_heads")
+    lines = [
+        f"[BoL] phase={results.get('phase', '?')} model_type={model_type} "
+        f"layers={layers if layers is not None else '?'} "
+        f"hidden={hidden if hidden is not None else '?'} "
+        f"heads={heads if heads is not None else '?'}"
+    ]
+
+    layer_sweep = results.get("layer_sweep", {})
+    ranked_layers = list(layer_sweep.get("ranked", [])[: max(1, int(top_k))])
+    if ranked_layers:
+        layer_bits = [
+            f"L{int(row.get('layer', -1))}(d={float(row.get('damage', 0.0)):.4f})"
+            for row in ranked_layers
+        ]
+        lines.append(f"[BoL] layer_sweep top-{len(layer_bits)}: " + ", ".join(layer_bits))
+
+    comp = results.get("component_ablation", {})
+    comp_rows = list(comp.get("rows", [])[: max(1, int(top_k))])
+    if comp_rows:
+        comp_bits = [
+            f"{str(row.get('component'))}(d={float(row.get('damage', 0.0)):.4f})"
+            for row in comp_rows
+        ]
+        lines.append(f"[BoL] component_ablation top-{len(comp_bits)}: " + ", ".join(comp_bits))
+
+    silhouette = results.get("silhouette", {})
+    if silhouette:
+        lines.append(
+            "[BoL] silhouette "
+            f"best_layer=L{int(silhouette.get('best_layer', -1))} "
+            f"separation={float(silhouette.get('best_separation', 0.0)):.4f}"
+        )
+
+    cka = results.get("cka", {})
+    if cka:
+        lines.append(
+            "[BoL] cka "
+            f"transformation_point={cka.get('transformation_point', 'n/a')}"
+        )
+
+    attn = results.get("attention_map", {})
+    if attn:
+        summary = attn.get("summary", {}) or {}
+        entropy_rows = list(attn.get("entropy_rows", []))
+        norm_entropy = (
+            float(np.mean([float(row.get("normalized_entropy", 0.0)) for row in entropy_rows]))
+            if entropy_rows
+            else 0.0
+        )
+        lines.append(
+            "[BoL] attention "
+            f"norm_entropy_mean={norm_entropy:.4f} "
+            f"structured_layers={int(summary.get('structured_layers', 0))} "
+            f"focused_layers={int(summary.get('focused_layers', 0))} "
+            f"specialized_layers={int(summary.get('specialized_layers', 0))}"
+        )
+
+    errors = results.get("errors", {})
+    if errors:
+        error_keys = ", ".join(sorted(str(k) for k in errors.keys()))
+        lines.append(f"[BoL] errors: {error_keys}")
+
+    return "\n".join(lines)
     try:
         return wandb.plot.heatmap(table, x, y, value, title=title)
     except Exception:
@@ -1024,6 +1072,9 @@ def run_all(
     clusters: Dict[str, Sequence[str]] = DEFAULT_CLUSTERS,
     max_new_tokens: int = 32,
     layer_stride: int | None = None,
+    print_summary: bool = False,
+    summary_top_k: int = 5,
+    log_to_wandb: bool = True,
 ) -> Dict[str, Any]:
     """Run all six BoL scans and log to an active W&B run.
 
@@ -1113,6 +1164,12 @@ def run_all(
 
     if was_training:
         model.train()
+
+    if bool(print_summary):
+        print(format_cli_summary(results, top_k=int(summary_top_k)))
+
+    if not bool(log_to_wandb):
+        return results
 
     if wandb is None:
         results["errors"]["wandb"] = "wandb is not installed; logging skipped."
@@ -1474,4 +1531,4 @@ def run_all(
     return results
 
 
-__all__ = ["run_all"]
+__all__ = ["run_all", "format_cli_summary"]
