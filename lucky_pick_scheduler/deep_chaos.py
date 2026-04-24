@@ -125,20 +125,19 @@ def _apply_last_dim_mask(tensor: torch.Tensor, alive: torch.Tensor | None) -> to
     if alive.numel() == 0:
         # All channels dead — multiply by a zero scalar so grad_fn is preserved.
         return tensor * 0.0
-    alive = alive.to(dtype=torch.long)
+    alive = alive.to(device=tensor.device, dtype=torch.long)
     valid = alive[(alive >= 0) & (alive < dim)]
     if valid.numel() == 0:
         return tensor * 0.0
-    # Build the index mask on CPU to avoid device-side index kernels inside
-    # forward hooks. On some large-model CUDA runs this removes intermittent
-    # illegal-memory faults observed later during grad clipping.
-    valid_cpu = valid.detach().to(device="cpu", dtype=torch.long)
-    mask_cpu = torch.zeros(dim, dtype=torch.float32, device="cpu")
-    mask_cpu[valid_cpu] = 1.0
-    mask = mask_cpu.to(device=tensor.device, dtype=tensor.dtype)
+    # Build a float mask on the same device as `tensor`. Using scatter instead
+    # of advanced-indexed assignment keeps the kernel launch simple and avoids
+    # the extra CPU roundtrip that was previously here (which caused a
+    # host/device sync on every forward hook).
+    mask = torch.zeros(dim, dtype=tensor.dtype, device=tensor.device)
+    mask.scatter_(0, valid, torch.ones_like(valid, dtype=tensor.dtype))
     # Broadcast mask over all leading dimensions and multiply.
     # This is differentiable: grad flows through alive positions unchanged.
-    return (tensor * mask).contiguous()
+    return tensor * mask
 
 
 def _safe_int(value: Any, default: int | None = None) -> int | None:
