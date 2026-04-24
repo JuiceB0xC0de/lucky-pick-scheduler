@@ -641,11 +641,10 @@ class DeepChaosScheduler:
             if not isinstance(tensor, torch.Tensor):
                 return output
 
-            if topo.mode in ("dead", "identity"):
-                # Multiply by 0.0 instead of new_zeros() so the grad_fn stays
-                # connected to the original tensor.  new_zeros() creates a fresh
-                # leaf with requires_grad=False, cutting the autograd graph.
+            if topo.mode == "dead":
                 return _replace_tensor_output(output, tensor * 0.0)
+            if topo.mode == "identity":
+                return output
 
             if component in {"q", "k", "v", "o"}:
                 if not attn_enabled:
