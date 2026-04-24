@@ -229,6 +229,34 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 
 ## Quantized / BitNet models
 
+## Model-family compatibility helpers
+
+For scripts that load many model families, use the built-in helpers:
+
+```python
+from lucky_pick_scheduler import (
+    model_load_kwargs_for_training,
+    resolve_training_precision,
+    tokenizer_load_kwargs_for_model,
+)
+
+precision = resolve_training_precision(model_name, cuda_available=torch.cuda.is_available())
+tokenizer = AutoTokenizer.from_pretrained(
+    model_name,
+    **tokenizer_load_kwargs_for_model(model_name),
+)
+model = AutoModelForCausalLM.from_pretrained(
+    model_name,
+    **model_load_kwargs_for_training(model_name, precision["dtype"]),
+)
+# Trainer(..., bf16=precision["bf16"], fp16=precision["fp16"])
+```
+
+This includes:
+- Phi/Phi-MoE defaulting to native HF code path (`trust_remote_code=False`)
+- Phi-MoE fp32 precision recommendation to avoid grouped MoE dtype mismatch
+- Falcon-E prequantized revision and Mistral regex tokenizer compat
+
 ### BitsAndBytes / GPTQ / AWQ (standard quantized)
 
 If your checkpoint is quantized and the trainer rejects full-parameter training, `prepare_model_for_training` auto-attaches LoRA adapters:

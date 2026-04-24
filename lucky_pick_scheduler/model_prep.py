@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import warnings
 from dataclasses import dataclass, field
-from typing import List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence
 
 import torch
 
@@ -88,6 +88,106 @@ def is_quantized_model(model: torch.nn.Module) -> bool:
         or getattr(model, "hf_quantizer", None) is not None
         or getattr(model, "quantization_method", None) is not None
     )
+
+
+# ---------------------------------------------------------------------------
+# Model-family helpers (tokenizer/model loading + precision defaults)
+# ---------------------------------------------------------------------------
+
+def _model_name_lower(model_name: str) -> str:
+    return str(model_name).lower()
+
+
+def is_phi_model_name(model_name: str) -> bool:
+    model_name_l = _model_name_lower(model_name)
+    return "phi-" in model_name_l or "/phi" in model_name_l
+
+
+def is_phi_moe_model_name(model_name: str) -> bool:
+    model_name_l = _model_name_lower(model_name)
+    return "phi" in model_name_l and "moe" in model_name_l
+
+
+def tokenizer_load_kwargs_for_model(
+    model_name: str,
+    *,
+    use_fast: bool = True,
+) -> Dict[str, Any]:
+    """Return robust tokenizer kwargs for a given model family.
+
+    - Phi models default to native HF code path (trust_remote_code=False) to avoid
+      dynamic-module API skew against older/newer transformers versions.
+    - Falcon-E uses `revision='prequantized'`.
+    - Mistral/Ministral enables fix_mistral_regex.
+    """
+    model_name_l = _model_name_lower(model_name)
+    is_phi = is_phi_model_name(model_name_l)
+    kwargs: Dict[str, Any] = {
+        "use_fast": bool(use_fast),
+        "trust_remote_code": not is_phi,
+    }
+    if "falcon-e" in model_name_l:
+        kwargs["revision"] = "prequantized"
+    if "mistral" in model_name_l or "ministral" in model_name_l:
+        kwargs["fix_mistral_regex"] = True
+    return kwargs
+
+
+def model_load_kwargs_for_training(model_name: str, target_dtype: torch.dtype) -> Dict[str, Any]:
+    """Return stable model-loading kwargs for text finetuning/training."""
+    model_name_l = _model_name_lower(model_name)
+    is_phi = is_phi_model_name(model_name_l)
+    kwargs: Dict[str, Any] = {
+        "trust_remote_code": not is_phi,
+    }
+    if "falcon-e" in model_name_l:
+        kwargs.update(
+            {
+                "revision": "prequantized",
+                "dtype": target_dtype,
+                "device_map": "auto",
+                "low_cpu_mem_usage": False,
+            }
+        )
+    elif "gemma-4" in model_name_l:
+        kwargs.update(
+            {
+                "device_map": None,
+                "dtype": target_dtype,
+                "attn_implementation": "eager",
+                "low_cpu_mem_usage": False,
+            }
+        )
+    else:
+        kwargs.update(
+            {
+                "device_map": None,
+                "dtype": target_dtype,
+                "low_cpu_mem_usage": False,
+            }
+        )
+    return kwargs
+
+
+def resolve_training_precision(model_name: str, *, cuda_available: bool) -> Dict[str, Any]:
+    """Return dtype + Trainer precision flags for stable training defaults.
+
+    Phi-MoE models currently need fp32 to avoid grouped MoE matmul dtype
+    mismatch (`float` activations vs `bfloat16` expert weights).
+    """
+    if is_phi_moe_model_name(model_name):
+        return {
+            "dtype": torch.float32,
+            "bf16": False,
+            "fp16": False,
+            "reason": "phi-moe grouped_mm dtype consistency",
+        }
+    return {
+        "dtype": torch.bfloat16 if cuda_available else torch.float32,
+        "bf16": bool(cuda_available),
+        "fp16": False,
+        "reason": "default",
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -286,6 +386,17 @@ def prepare_model_for_training(
     config: ModelPrepConfig | None = None,
 ) -> tuple[torch.nn.Module, ModelPrepReport]:
     cfg = config or ModelPrepConfig()
+
+    model_id = str(getattr(getattr(model, "config", None), "_name_or_path", "") or "")
+    if model_id and is_phi_moe_model_name(model_id):
+        # Phi-MoE grouped expert matmul can fail when autocast produces fp32
+        # activations while expert weights remain bf16. Keep model params fp32.
+        model = model.float()
+        if cfg.verbose:
+            print(
+                "[lucky_pick_scheduler] Phi-MoE detected; cast model to float32 "
+                "for grouped_mm dtype consistency."
+            )
 
     bitnet = is_bitnet_model(model)
     quantized = is_quantized_model(model)
