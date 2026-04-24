@@ -1,6 +1,6 @@
 # lucky-pick-scheduler
 
-A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre/post training neural network diagnostic suite (BoL scans) that logs structured results to Weights & Biases.
+A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre/post training neural network diagnostic suite (BoL scans).
 
 ## Install
 
@@ -8,7 +8,7 @@ A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre
 pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
 ```
 
-Dependencies: `torch`, `transformers`, `wandb`. Optional: `peft` (required for quantized models), `scipy` (used in silhouette scan).
+Dependencies: `torch`, `transformers`. Optional: `wandb` (integration currently not ready), `peft` (required for quantized models), `scipy` (used in silhouette scan).
 
 ---
 
