@@ -42,6 +42,36 @@ Sacred and victim ranges are computed from `num_hidden_layers`. If the model has
 
 ---
 
+## Tested Models
+
+The scheduler auto-config path was tested across the following checkpoints:
+
+| Model | Size / Type | Scheduler Auto-Config |
+|---|---|---|
+| Qwen 2.5 3B Instruct | 3B | ✅ |
+| Falcon-E 3B Instruct | 3B | ✅ |
+| SmolLM2-360M | 360M Tiny | ✅ |
+| Ministral 3 3B Instruct 2512 | 3B | ✅ |
+| Doge-320M | 320M Tiny | ✅ |
+| Llama 3.2 3B | 3B | ✅ |
+| Gemma-4-E4B | ~4B (efficient) | ✅ |
+| Phi-4-mini-instruct | Mini | ✅ |
+| OLMo-2-0425-1B | 1B | ✅ |
+| Phi-tiny-MoE-instruct | Tiny MoE | ✅ |
+
+## Compatibility & Limitations
+
+The scheduler was tested on the architectures above, and layer discovery / sacred-victim auto-configuration worked without manual layer mapping, including MoE models.
+
+Notes from real-world runs:
+- `microsoft/Phi-*` models are loaded through native `transformers` classes (`trust_remote_code=False`) to avoid dynamic-module API skew.
+- `microsoft/Phi-tiny-MoE-instruct` may require fp32 training precision to avoid grouped MoE matmul dtype mismatches (`float` vs `bfloat16`).
+- `google/gemma-4-*` text-only finetuning paths may need operating on the language submodule with explicit device placement (`device_map=None` at load + manual `.to("cuda")`).
+
+No permanently unsupported model family is currently known, but highly custom remote-code checkpoints can still require model-specific loader flags.
+
+---
+
 ## DeepChaosScheduler Usage
 
 ### Minimal
