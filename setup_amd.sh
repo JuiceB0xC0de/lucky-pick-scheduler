@@ -6,9 +6,9 @@ set -e
 # Mount NVMe scratch disk
 mkdir -p /scratch
 if ! mountpoint -q /scratch; then
-    mkfs.ext4 -F /dev/nvme1n1
-    mount /dev/nvme1n1 /scratch
-    echo "/dev/nvme1n1 /scratch ext4 defaults,nofail 0 2" >> /etc/fstab
+    mkfs.ext4 -F /dev/vdc
+    mount /dev/vdc /scratch
+    echo "/dev/vdc /scratch ext4 defaults,nofail 0 2" >> /etc/fstab
 fi
 echo "[setup] scratch disk mounted at /scratch"
 
