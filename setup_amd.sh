@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# AMD MI300X droplet setup — gpu-amd-base (Ubuntu 24.04, ROCm 6.4.0)
+# AMD MI300X droplet setup — PyTorch 2.6.0 - ROCm 7.0 (Ubuntu 24.04)
 
 # Mount NVMe scratch disk
 mkdir -p /scratch
@@ -15,8 +15,8 @@ echo "[setup] scratch disk mounted at /scratch"
 # Python stack
 pip install --upgrade pip setuptools wheel
 
-# PyTorch ROCm 6.4
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.4
+# PyTorch ROCm 7.0
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.0
 
 # ML deps
 pip install \
