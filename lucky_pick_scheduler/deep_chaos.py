@@ -501,6 +501,7 @@ class DeepChaosScheduler:
         self.active_layers = active | self.sacred
         self.topologies.clear()
         mode_counts = {"both": 0, "attn": 0, "mlp": 0, "identity": 0, "dead": 0}
+        mode_layers: Dict[str, List[int]] = {"both": [], "attn": [], "mlp": [], "identity": [], "dead": []}
         stats = {key: [] for key in ("q", "k", "v", "o", "gate", "up", "down")}
 
         sliced_elements = 0
@@ -510,6 +511,7 @@ class DeepChaosScheduler:
             binding = self.bindings[layer]
             topo = LayerTopology(mode=self._layer_mode(layer, rng))
             mode_counts[topo.mode] += 1
+            mode_layers[topo.mode].append(layer)
 
             if topo.mode in ("dead", "identity"):
                 self.topologies[layer] = topo
@@ -617,13 +619,33 @@ class DeepChaosScheduler:
             "compute_pct": 100.0 * compute_ratio,
         }
         if bool(self.config.announce_reshuffles):
+            sacred_sorted = sorted(self.sacred)
+            active_sorted = sorted(self.active_layers)
+            dead_sorted = sorted(layer for layer in self.victims if layer not in self.active_layers)
+            fmt_pct = lambda values: f"{100.0 * avg(values):5.1f}%" if values else "  n/a"
             print(
-                "DeepChaos reshuffle: "
-                f"step={global_step} block={block_idx} "
-                f"active={active_count}/{max(1, num_victims)} "
-                f"modes(both/attn/mlp/id/dead)="
-                f"{mode_counts['both']}/{mode_counts['attn']}/{mode_counts['mlp']}/"
-                f"{mode_counts['identity']}/{mode_counts['dead']}"
+                f"\n{'=' * 78}\n"
+                f"DeepChaos reshuffle  step={global_step}  block={block_idx}  "
+                f"sticky_interval={self.config.sticky_interval}  seed={self.config.seed}\n"
+                f"{'-' * 78}\n"
+                f"  layer pool      : sacred={sacred_sorted}  victims={self.victims[0]}..{self.victims[-1]} "
+                f"({num_victims})\n"
+                f"  active layers   : {active_sorted}  "
+                f"({active_count}/{max(1, num_victims)} victims, density={100.0 * active_count / max(1, num_victims):.1f}%)\n"
+                f"  dead layers     : {dead_sorted}  ({len(dead_sorted)})\n"
+                f"  mode breakdown  :\n"
+                f"      both     ({mode_counts['both']:>2}): {sorted(mode_layers['both'])}\n"
+                f"      attn     ({mode_counts['attn']:>2}): {sorted(mode_layers['attn'])}\n"
+                f"      mlp      ({mode_counts['mlp']:>2}): {sorted(mode_layers['mlp'])}\n"
+                f"      identity ({mode_counts['identity']:>2}): {sorted(mode_layers['identity'])}\n"
+                f"      dead     ({mode_counts['dead']:>2}): {sorted(mode_layers['dead'])}\n"
+                f"  attn surv%      : q={fmt_pct(stats['q'])}  k={fmt_pct(stats['k'])}  "
+                f"v={fmt_pct(stats['v'])}  o={fmt_pct(stats['o'])}\n"
+                f"  mlp  surv%      : gate={fmt_pct(stats['gate'])}  up={fmt_pct(stats['up'])}  "
+                f"down={fmt_pct(stats['down'])}\n"
+                f"  compute ratio   : {100.0 * compute_ratio:.1f}%  "
+                f"({sliced_elements:,} / {full_elements:,} weight elements engaged)\n"
+                f"{'=' * 78}"
             )
         return self.cached_stats
 
