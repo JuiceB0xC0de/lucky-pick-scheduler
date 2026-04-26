@@ -1,11 +1,17 @@
-"""Trainer-agnostic BoL scans with W&B logging.
+"""Trainer-agnostic BoL neural network diagnostic suite.
+
+Runs six scans (weight fingerprint, layer sweep, component ablation,
+silhouette, CKA, attention map) before and after training and prints
+results to the terminal.
 
 Usage:
-    from bol_scans import run_all
+    from bol_scans import run_all, format_results_for_cli
 
-    run_all(model, tokenizer, phase="pre")
+    pre = run_all(model, tokenizer, phase="pre", log_to_wandb=False)
+    print(format_results_for_cli(pre, phase="pre"))
     trainer.train()
-    run_all(model, tokenizer, phase="post")
+    post = run_all(model, tokenizer, phase="post", log_to_wandb=False)
+    print(format_results_for_cli(post, phase="post"))
 """
 
 from __future__ import annotations
@@ -984,6 +990,112 @@ def _try_plot_heatmap(table: wandb.Table, x: str, y: str, value: str, title: str
         return None
 
 
+def _print_fingerprint(results: Dict[str, Any]) -> None:
+    fp = results.get("weight_fingerprint", {}) or {}
+    rows = fp.get("rows", [])
+    if not rows:
+        return
+    label = str(results.get("phase", "?")).upper()
+    w = 70
+    print(f"\n{'=' * w}")
+    print(f"FINGERPRINTING: {label}")
+    print(f"{'=' * w}")
+    print(f"  {'Tensor':<60} {'mean':>10} {'std':>10}   {'sparse':>6}  {'spec_norm':>9}")
+    print(f"  {'-' * (w + 10)}")
+    for row in rows:
+        sn_raw = row.get("spectral_norm")
+        sn = f"{float(sn_raw):.6f}" if sn_raw is not None else "n/a"
+        print(
+            f"  {str(row.get('name', '')):<60} {float(row.get('mean', 0.0)):>10.6f}   "
+            f"{float(row.get('std', 0.0)):>10.6f}   "
+            f"{float(row.get('sparsity', 0.0)):>6.4f}  {sn:>9}"
+        )
+
+
+def _damage_tag(damage: float) -> str:
+    if damage > 1.0:
+        return "🔴 CRITICAL"
+    if damage > 0.3:
+        return "🟡 MODERATE"
+    return "🟢 REMOVABLE"
+
+
+def _print_layer_sweep(results: Dict[str, Any]) -> None:
+    sweep = results.get("layer_sweep", {}) or {}
+    rows = sweep.get("rows", [])
+    if not rows:
+        return
+    baseline_loss = float(sweep.get("baseline_loss", float("nan")))
+    arch = results.get("architecture", {}) or {}
+
+    print(f"\n{'=' * 70}")
+    print("🔒 Scientific Integrity Mode: ON (FP32)")
+    print(f"📦 Model: {arch.get('model_type', '?')}")
+    print(f"\nBASELINE loss: {baseline_loss:.4f}")
+    print()
+    print(f"  {'Layer':<8} {'Loss':>8}  {'Damage':>8}  {'Tag':<14}  Sample output")
+    print(f"  {'-' * 90}")
+    layer_w = max(2, len(str(max(int(r.get("layer", 0)) for r in rows))))
+    for row in rows:
+        damage = float(row.get("damage", 0.0))
+        tag = _damage_tag(damage)
+        changed = "[CHANGED]" if bool(row.get("changed")) else "[SAME]   "
+        sample = str(row.get("sample", ""))[:60]
+        print(
+            f"  L{int(row.get('layer', 0)):0{layer_w}d}   "
+            f"{float(row.get('loss', 0.0)):>8.4f}   {damage:>+8.4f}  "
+            f"{tag:<14}  {changed} {sample}"
+        )
+
+    ranked = sweep.get("ranked", []) or []
+    if ranked:
+        print(f"\n{'=' * 70}")
+        print("LAYER IMPORTANCE RANKING  (most critical → safest to remove)")
+        print(f"{'=' * 70}")
+        for i, row in enumerate(ranked, 1):
+            damage = float(row.get("damage", 0.0))
+            tag = _damage_tag(damage)
+            print(
+                f"  #{i:02d}  Layer {int(row.get('layer', 0)):02d}  "
+                f"damage: {damage:+.4f}  {tag}"
+            )
+
+
+def _print_silhouette(results: Dict[str, Any]) -> None:
+    sil = results.get("silhouette", {}) or {}
+    rows = sil.get("rows", [])
+    if not rows:
+        return
+    bar_max = max((float(r.get("separation", 0.0)) for r in rows), default=0.0) or 1.0
+    layer_w = max(2, len(str(max(int(r.get("layer", 0)) for r in rows))))
+    print(f"\n  {'Layer':<8} {'rel avg':>9}  {'unrel avg':>9}  {'sep':>8}  bar")
+    print(f"  {'-' * 65}")
+    best_layer = sil.get("best_layer")
+    for row in rows:
+        sep = float(row.get("separation", 0.0))
+        bar_len = max(0, int((sep / bar_max) * 14))
+        bar = "█" * bar_len
+        is_best = best_layer is not None and int(row.get("layer", -1)) == int(best_layer)
+        best_marker = " ← BEST" if is_best else ""
+        print(
+            f"  L{int(row.get('layer', 0)):0{layer_w}d}  "
+            f"{float(row.get('related_avg', 0.0)):>9.4f}  "
+            f"{float(row.get('unrelated_avg', 0.0)):>9.4f}"
+            f"  {sep:>+8.4f}  {bar}{best_marker}"
+        )
+    print(
+        f"\n→ Best single layer: {best_layer} "
+        f"(sep={float(sil.get('best_separation', 0.0)):.4f})"
+    )
+
+
+def format_verbose_output(results: Dict[str, Any]) -> None:
+    """Print full CLI-style verbose output to stdout."""
+    _print_fingerprint(results)
+    _print_layer_sweep(results)
+    _print_silhouette(results)
+
+
 def format_cli_summary(results: Dict[str, Any], *, top_k: int = 5) -> str:
     architecture = results.get("architecture", {}) or {}
     model_type = architecture.get("model_type", "unknown")
@@ -1053,6 +1165,11 @@ def format_cli_summary(results: Dict[str, Any], *, top_k: int = 5) -> str:
         lines.append(f"[BoL] errors: {error_keys}")
 
     return "\n".join(lines)
+
+
+def _try_plot_heatmap(table: wandb.Table, x: str, y: str, value: str, title: str):
+    if wandb is None:
+        return None
     try:
         return wandb.plot.heatmap(table, x, y, value, title=title)
     except Exception:
@@ -1073,14 +1190,17 @@ def run_all(
     max_new_tokens: int = 32,
     layer_stride: int | None = None,
     print_summary: bool = False,
+    verbose: bool = False,
     summary_top_k: int = 5,
-    log_to_wandb: bool = True,
+    log_to_wandb: bool = False,
 ) -> Dict[str, Any]:
-    """Run all six BoL scans and log to an active W&B run.
+    """Run all six BoL scans and return results dict.
+
+    Set ``log_to_wandb=True`` to also log to an active W&B run.
+    Use :func:`format_results_for_cli` to print results to the terminal.
 
     Requirements:
-    - `model` and `tokenizer` are already loaded.
-    - `wandb.run` is active if logging is desired.
+    - ``model`` and ``tokenizer`` are already loaded.
     """
 
     prefix = _phase_prefix(phase)
@@ -1165,7 +1285,9 @@ def run_all(
     if was_training:
         model.train()
 
-    if bool(print_summary):
+    if bool(verbose):
+        format_verbose_output(results)
+    elif bool(print_summary):
         print(format_cli_summary(results, top_k=int(summary_top_k)))
 
     if not bool(log_to_wandb):
@@ -1531,4 +1653,278 @@ def run_all(
     return results
 
 
-__all__ = ["run_all", "format_cli_summary"]
+def _damage_tag(damage: float) -> str:
+    if damage > 1.0:
+        return "CRITICAL"
+    if damage > 0.3:
+        return "MODERATE"
+    return "REMOVABLE"
+
+
+def _verdict_icon(verdict: str) -> str:
+    icons = {
+        "structured": "✅",
+        "weak": "⚠️",
+        "no_structure": "❌",
+        "focused": "🎯",
+        "moderate": "🔄",
+        "diffuse": "🌫️",
+        "specialized": "🔱",
+        "redundant": "🔸",
+    }
+    return icons.get(verdict, "  ")
+
+
+def format_results_for_cli(results: Dict[str, Any], *, phase: str = "pre") -> str:
+    """Format BoL scan results as readable CLI output — matches original bol-tools-v2 style.
+
+    Prints all six scans with the same live-print aesthetic as the originals:
+    per-item rows, CRITICAL/MODERATE/REMOVABLE tags, section separators,
+    and ranked summary tables. Call at train start and train end.
+    """
+    phase_label = "PRE-TRAIN" if phase == "pre" else "POST-TRAIN"
+    architecture = results.get("architecture", {}) or {}
+    model_type = architecture.get("model_type", "unknown")
+    hidden = architecture.get("hidden_size")
+    layers = architecture.get("num_layers")
+    heads = architecture.get("num_heads")
+
+    out = []
+    out.append("")
+    out.append("=" * 70)
+    out.append(f"  🤖 BoL Network Diagnostic  [{phase_label}]")
+    out.append(f"  Model: {model_type}  |  Layers: {layers}  |  Hidden: {hidden}  |  Heads: {heads}")
+    out.append("=" * 70)
+    out.append("")
+
+    # ── 1. WEIGHT FINGERPRINT ─────────────────────────────────────
+    fp = results.get("weight_fingerprint")
+    if fp and fp.get("summary", {}).get("tensor_count", 0) != 0:
+        summary = fp["summary"]
+        layer_summ = fp.get("layer_summary", [])
+        layer_comp = fp.get("layer_component_summary", [])
+        out.append("-" * 70)
+        out.append("  📊 Weight Fingerprint")
+        out.append("-" * 70)
+        out.append(
+            f"  tensors={summary.get('tensor_count', 0):>6}   "
+            f"avg_abs_mean={summary.get('avg_abs_mean', 0):.6f}   "
+            f"avg_std={summary.get('avg_std', 0):.6f}   "
+            f"avg_sparsity={summary.get('avg_sparsity', 0):.6f}"
+        )
+        out.append("")
+        if layer_summ:
+            out.append(f"  {'Layer':>6}   {'Block':<32}   {'abs_mean':>12}   {'std':>12}   {'sparsity':>12}")
+            out.append("  " + "-" * 68)
+            for row in layer_summ:
+                block = str(row.get("transformer_block", ""))[:32]
+                out.append(
+                    f"  L{int(row['layer']):02d}    {block:<32}   "
+                    f"{float(row['abs_mean']):>12.6f}   "
+                    f"{float(row['std']):>12.6f}   "
+                    f"{float(row['sparsity']):>12.6f}"
+                )
+        out.append("")
+
+    # ── 2. LAYER SWEEP ────────────────────────────────────────────
+    sweep = results.get("layer_sweep")
+    if sweep:
+        rows = sweep.get("rows", [])
+        ranked = sweep.get("ranked", [])
+        baseline = float(sweep.get("baseline_loss", 0))
+        max_damage = float(sweep.get("summary", {}).get("max_damage", 0))
+
+        out.append("-" * 70)
+        out.append("  🔬 Layer Sweep  —  zero each layer, measure loss damage")
+        out.append("-" * 70)
+        out.append(f"  BASELINE loss: {baseline:.4f}   max_damage: {max_damage:+.4f}")
+        out.append("")
+        out.append(f"  {'Layer':>6}   {'Loss':>10}   {'Damage':>10}   {'Tag':<10}   Sample output")
+        out.append("  " + "-" * 68)
+        for row in rows:
+            d = float(row.get("damage", 0))
+            tag = _damage_tag(d)
+            sample = str(row.get("sample", ""))[:48].replace("\n", " ")
+            chg = "CHANGED" if row.get("changed") else "stable"
+            out.append(
+                f"  L{int(row['layer']):02d}    {float(row.get('loss', 0)):>10.4f}   "
+                f"{d:>+10.4f}   {tag:<10}   [{chg}] {sample}"
+            )
+
+        if ranked:
+            out.append("")
+            out.append("  LAYER IMPORTANCE RANKING  (most critical → safest to remove)")
+            out.append("  " + "-" * 68)
+            for rank, row in enumerate(ranked, 1):
+                d = float(row.get("damage", 0))
+                tag = _damage_tag(d)
+                out.append(f"  #{rank:02d}   L{int(row['layer']):02d}   damage: {d:>+8.4f}   {tag}")
+        out.append("")
+
+    # ── 3. COMPONENT ABLATION ─────────────────────────────────────
+    comp = results.get("component_ablation")
+    if comp:
+        rows = comp.get("rows", [])
+        baseline = float(comp.get("baseline_loss", 0))
+        probes = list(results.get("component_ablation", {}).get("rows", [{}])[0].get("outputs", {}).keys()) if False else ["probe"]
+
+        out.append("-" * 70)
+        out.append("  🧩 Component Ablation  —  zero each projection type, measure damage")
+        out.append("-" * 70)
+        out.append(f"  BASELINE loss: {baseline:.4f}")
+        out.append("")
+        for row in rows:
+            comp_name = str(row.get("component", ""))
+            tensors = int(row.get("zeroed_tensors", 0))
+            loss_val = float(row.get("loss", 0))
+            d = float(row.get("damage", 0))
+            loss_str = f"{loss_val:.4f}" if not (loss_val == 999.9999) else "NaN"
+            out.append(f"  {'='*66}")
+            out.append(f"  ZEROED: {comp_name}  ({tensors} tensors)   loss: {loss_str}   (delta {d:+.4f})")
+            out.append(f"  {'='*66}")
+            outputs = row.get("outputs", {})
+            for p, v in outputs.items():
+                tag = "CHANGED" if v.get("changed") else "stable"
+                text = str(v.get("text", ""))[:55]
+                out.append(f"    [{tag:7s}] {str(p)[:35]:<35} -> {text}")
+            out.append("")
+        out.append("")
+        # Ranked summary
+        sorted_comp = sorted(rows, key=lambda x: float(x.get("damage", 0)), reverse=True)
+        out.append("  COMPONENT IMPORTANCE RANKING")
+        out.append("  " + "-" * 68)
+        for row in sorted_comp:
+            d = float(row.get("damage", 0))
+            tag = _damage_tag(d)
+            out.append(f"  {str(row.get('component', '')):<35}  delta_loss: {d:>+8.4f}   {tag}")
+        out.append("")
+
+    # ── 4. SILHOUETTE ─────────────────────────────────────────────
+    sil = results.get("silhouette")
+    if sil:
+        rows = sil.get("rows", [])
+        best_layer = int(sil.get("best_layer", -1))
+        best_sep = float(sil.get("best_separation", 0))
+
+        out.append("-" * 70)
+        out.append("  🎨 Silhouette  —  semantic separation in hidden space")
+        out.append("-" * 70)
+        out.append(f"  BASELINE loss: {best_layer}  |  best_layer: L{best_layer}  |  best_separation: {best_sep:.4f}")
+        out.append("")
+        out.append(f"  {'Layer':>6}   {'Related':>10}   {'Unrelated':>10}   {'Separation':>12}   {'p-value':>10}   Sig?")
+        out.append("  " + "-" * 68)
+        for row in rows:
+            sig = "✓" if row.get("significant") else " "
+            out.append(
+                f"  L{int(row['layer']):02d}    "
+                f"{float(row.get('related_avg', 0)):>10.4f}   "
+                f"{float(row.get('unrelated_avg', 0)):>10.4f}   "
+                f"{float(row.get('separation', 0)):>+12.4f}   "
+                f"{float(row.get('p_value', 0)):>10.6f}   {sig}"
+            )
+        out.append("")
+
+    # ── 5. CKA ────────────────────────────────────────────────────
+    cka = results.get("cka")
+    if cka:
+        tp = cka.get("transformation_point")
+        evo = {r["layer"]: r["cka_vs_input"] for r in cka.get("evolution_rows", [])}
+        cluster_rows = cka.get("cluster_rows", [])
+
+        out.append("-" * 70)
+        out.append("  🔗 CKA  —  representational similarity across layers")
+        out.append("-" * 70)
+        out.append(f"  transformation_point: {'L' + str(tp) if tp is not None else 'n/a'}")
+        out.append("")
+        if cluster_rows:
+            out.append(f"  {'Layer':>6}   {'Within':>10}   {'Cross':>10}   {'Separation':>12}   {'vs_Input':>10}")
+            out.append("  " + "-" * 68)
+            for row in cluster_rows:
+                lbl = f"L{int(row['layer']):02d}"
+                within = float(row.get("within_cka", 0))
+                cross = float(row.get("cross_cka", 0))
+                sep = float(row.get("separation", 0))
+                vs_in = float(evo.get(int(row["layer"]), 0))
+                out.append(
+                    f"  {lbl}    {within:>10.4f}   {cross:>10.4f}   {sep:>+12.4f}   {vs_in:>10.4f}"
+                )
+        out.append("")
+
+    # ── 6. ATTENTION MAP ─────────────────────────────────────────
+    attn = results.get("attention_map")
+    if attn:
+        summary = attn.get("summary", {})
+        out.append("-" * 70)
+        out.append("  👁️  Attention Map")
+        out.append("-" * 70)
+        out.append(
+            f"  structured={summary.get('structured_layers', 0)}   "
+            f"focused={summary.get('focused_layers', 0)}   "
+            f"specialized={summary.get('specialized_layers', 0)}"
+        )
+
+        entropy_rows = attn.get("entropy_rows", [])
+        if entropy_rows:
+            out.append("")
+            out.append("  Entropy by Layer:")
+            out.append(f"  {'Layer':>6}   {'Mean Entropy':>14}   {'Norm Entropy':>14}   Interpretation")
+            out.append("  " + "-" * 66)
+            for row in entropy_rows:
+                interp = row.get("interpretation", "")
+                icon = _verdict_icon(interp)
+                out.append(
+                    f"  L{int(row['layer']):02d}    "
+                    f"{float(row.get('mean_entropy', 0)):>14.4f}   "
+                    f"{float(row.get('normalized_entropy', 0)):>14.4f}   {icon} {interp}"
+                )
+
+        sep_rows = attn.get("separation_rows", [])
+        if sep_rows:
+            out.append("")
+            out.append("  Semantic Separation by Layer:")
+            out.append(f"  {'Layer':>6}   {'Related Sim':>12}   {'Unrel Sim':>12}   {'Separation':>12}   Verdict")
+            out.append("  " + "-" * 66)
+            for row in sep_rows:
+                verdict = row.get("verdict", "")
+                icon = _verdict_icon(verdict)
+                out.append(
+                    f"  L{int(row['layer']):02d}    "
+                    f"{float(row.get('related_sim', 0)):>12.4f}   "
+                    f"{float(row.get('unrelated_sim', 0)):>12.4f}   "
+                    f"{float(row.get('separation', 0)):>+12.4f}   {icon} {verdict}"
+                )
+
+        head_rows = attn.get("head_rows", [])
+        if head_rows:
+            out.append("")
+            out.append("  Head Diversity by Layer:")
+            out.append(f"  {'Layer':>6}   {'Head Diversity':>16}   Interpretation")
+            out.append("  " + "-" * 50)
+            for row in head_rows:
+                interp = row.get("interpretation", "")
+                icon = _verdict_icon(interp)
+                out.append(
+                    f"  L{int(row['layer']):02d}    "
+                    f"{float(row.get('head_diversity', 0)):>16.4f}   {icon} {interp}"
+                )
+        out.append("")
+
+    # ── ERRORS ────────────────────────────────────────────────────
+    errors = results.get("errors", {})
+    if errors:
+        out.append("-" * 70)
+        out.append("  ⚠️  Scan Errors")
+        out.append("-" * 70)
+        for scan, err in sorted(errors.items()):
+            out.append(f"  {scan}: {str(err)[:60]}")
+        out.append("")
+
+    out.append("=" * 70)
+    out.append(f"  End of BoL Diagnostic  [{phase_label}]")
+    out.append("=" * 70)
+    out.append("")
+
+    return "\n".join(out)
+
+
+__all__ = ["run_all", "format_cli_summary", "format_results_for_cli"]
