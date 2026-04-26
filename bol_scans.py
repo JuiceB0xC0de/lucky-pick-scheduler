@@ -990,112 +990,6 @@ def _try_plot_heatmap(table: wandb.Table, x: str, y: str, value: str, title: str
         return None
 
 
-def _print_fingerprint(results: Dict[str, Any]) -> None:
-    fp = results.get("weight_fingerprint", {}) or {}
-    rows = fp.get("rows", [])
-    if not rows:
-        return
-    label = str(results.get("phase", "?")).upper()
-    w = 70
-    print(f"\n{'=' * w}")
-    print(f"FINGERPRINTING: {label}")
-    print(f"{'=' * w}")
-    print(f"  {'Tensor':<60} {'mean':>10} {'std':>10}   {'sparse':>6}  {'spec_norm':>9}")
-    print(f"  {'-' * (w + 10)}")
-    for row in rows:
-        sn_raw = row.get("spectral_norm")
-        sn = f"{float(sn_raw):.6f}" if sn_raw is not None else "n/a"
-        print(
-            f"  {str(row.get('name', '')):<60} {float(row.get('mean', 0.0)):>10.6f}   "
-            f"{float(row.get('std', 0.0)):>10.6f}   "
-            f"{float(row.get('sparsity', 0.0)):>6.4f}  {sn:>9}"
-        )
-
-
-def _damage_tag(damage: float) -> str:
-    if damage > 1.0:
-        return "🔴 CRITICAL"
-    if damage > 0.3:
-        return "🟡 MODERATE"
-    return "🟢 REMOVABLE"
-
-
-def _print_layer_sweep(results: Dict[str, Any]) -> None:
-    sweep = results.get("layer_sweep", {}) or {}
-    rows = sweep.get("rows", [])
-    if not rows:
-        return
-    baseline_loss = float(sweep.get("baseline_loss", float("nan")))
-    arch = results.get("architecture", {}) or {}
-
-    print(f"\n{'=' * 70}")
-    print("🔒 Scientific Integrity Mode: ON (FP32)")
-    print(f"📦 Model: {arch.get('model_type', '?')}")
-    print(f"\nBASELINE loss: {baseline_loss:.4f}")
-    print()
-    print(f"  {'Layer':<8} {'Loss':>8}  {'Damage':>8}  {'Tag':<14}  Sample output")
-    print(f"  {'-' * 90}")
-    layer_w = max(2, len(str(max(int(r.get("layer", 0)) for r in rows))))
-    for row in rows:
-        damage = float(row.get("damage", 0.0))
-        tag = _damage_tag(damage)
-        changed = "[CHANGED]" if bool(row.get("changed")) else "[SAME]   "
-        sample = str(row.get("sample", ""))[:60]
-        print(
-            f"  L{int(row.get('layer', 0)):0{layer_w}d}   "
-            f"{float(row.get('loss', 0.0)):>8.4f}   {damage:>+8.4f}  "
-            f"{tag:<14}  {changed} {sample}"
-        )
-
-    ranked = sweep.get("ranked", []) or []
-    if ranked:
-        print(f"\n{'=' * 70}")
-        print("LAYER IMPORTANCE RANKING  (most critical → safest to remove)")
-        print(f"{'=' * 70}")
-        for i, row in enumerate(ranked, 1):
-            damage = float(row.get("damage", 0.0))
-            tag = _damage_tag(damage)
-            print(
-                f"  #{i:02d}  Layer {int(row.get('layer', 0)):02d}  "
-                f"damage: {damage:+.4f}  {tag}"
-            )
-
-
-def _print_silhouette(results: Dict[str, Any]) -> None:
-    sil = results.get("silhouette", {}) or {}
-    rows = sil.get("rows", [])
-    if not rows:
-        return
-    bar_max = max((float(r.get("separation", 0.0)) for r in rows), default=0.0) or 1.0
-    layer_w = max(2, len(str(max(int(r.get("layer", 0)) for r in rows))))
-    print(f"\n  {'Layer':<8} {'rel avg':>9}  {'unrel avg':>9}  {'sep':>8}  bar")
-    print(f"  {'-' * 65}")
-    best_layer = sil.get("best_layer")
-    for row in rows:
-        sep = float(row.get("separation", 0.0))
-        bar_len = max(0, int((sep / bar_max) * 14))
-        bar = "█" * bar_len
-        is_best = best_layer is not None and int(row.get("layer", -1)) == int(best_layer)
-        best_marker = " ← BEST" if is_best else ""
-        print(
-            f"  L{int(row.get('layer', 0)):0{layer_w}d}  "
-            f"{float(row.get('related_avg', 0.0)):>9.4f}  "
-            f"{float(row.get('unrelated_avg', 0.0)):>9.4f}"
-            f"  {sep:>+8.4f}  {bar}{best_marker}"
-        )
-    print(
-        f"\n→ Best single layer: {best_layer} "
-        f"(sep={float(sil.get('best_separation', 0.0)):.4f})"
-    )
-
-
-def format_verbose_output(results: Dict[str, Any]) -> None:
-    """Print full CLI-style verbose output to stdout."""
-    _print_fingerprint(results)
-    _print_layer_sweep(results)
-    _print_silhouette(results)
-
-
 def format_cli_summary(results: Dict[str, Any], *, top_k: int = 5) -> str:
     architecture = results.get("architecture", {}) or {}
     model_type = architecture.get("model_type", "unknown")
@@ -1286,7 +1180,7 @@ def run_all(
         model.train()
 
     if bool(verbose):
-        format_verbose_output(results)
+        print(format_results_for_cli(results, phase=str(phase)))
     elif bool(print_summary):
         print(format_cli_summary(results, top_k=int(summary_top_k)))
 
