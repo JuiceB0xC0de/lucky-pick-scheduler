@@ -14,12 +14,14 @@ class BOLScanner:
         tokenizer,
         *,
         print_summary: bool = True,
+        verbose: bool = True,
         summary_top_k: int = 5,
         **scan_kwargs: Any,
     ):
         self.model = model
         self.tokenizer = tokenizer
         self.print_summary = bool(print_summary)
+        self.verbose = bool(verbose)
         self.summary_top_k = int(summary_top_k)
         self.scan_kwargs = dict(scan_kwargs)
 
@@ -31,6 +33,7 @@ class BOLScanner:
             self.tokenizer,
             phase=phase,
             print_summary=self.print_summary,
+            verbose=self.verbose,
             summary_top_k=self.summary_top_k,
             **kwargs,
         )
