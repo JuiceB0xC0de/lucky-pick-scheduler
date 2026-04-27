@@ -18,6 +18,7 @@ class BoLWandbCallback(TrainerCallback):
         run_pre_train: bool = True,
         run_post_train: bool = True,
         print_summary: bool = True,
+        verbose: bool = True,
         summary_top_k: int = 5,
         scan_kwargs: Optional[Dict[str, Any]] = None,
     ):
@@ -26,6 +27,7 @@ class BoLWandbCallback(TrainerCallback):
         self.run_pre_train = bool(run_pre_train)
         self.run_post_train = bool(run_post_train)
         self.print_summary = bool(print_summary)
+        self.verbose = bool(verbose)
         self.summary_top_k = int(summary_top_k)
         self.scan_kwargs = dict(scan_kwargs or {})
         self.pre_results: Optional[Dict[str, Any]] = None
@@ -37,6 +39,7 @@ class BoLWandbCallback(TrainerCallback):
             self.tokenizer,
             phase=phase,
             print_summary=self.print_summary,
+            verbose=self.verbose,
             summary_top_k=self.summary_top_k,
             **self.scan_kwargs,
         )
@@ -59,4 +62,5 @@ class BoLPrintCallback(BoLWandbCallback):
 
     def __init__(self, model, tokenizer, **kwargs):
         kwargs.setdefault("print_summary", True)
+        kwargs.setdefault("verbose", True)
         super().__init__(model, tokenizer, **kwargs)
