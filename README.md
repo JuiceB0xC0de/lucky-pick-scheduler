@@ -35,6 +35,15 @@ cd lucky-pick-scheduler && git fetch origin && git reset --hard origin/main && \
     pip install --no-deps .
 ```
 
+Before launching training, set:
+
+```bash
+export TORCH_BLAS_PREFER_HIPBLASLT=1
+```
+
+Tells the ROCm matmul dispatcher to prefer hipBLASLt over rocBLAS where it has
+a kernel — small but free throughput gain on MI300X.
+
 ### Dependencies
 
 `torch`, `transformers`. Optional: `wandb` (full integration via `bol_wandb`), `peft` (required for quantized models), `scipy` (used in silhouette scan), `trl` (recommended trainer wrapper).
@@ -94,7 +103,7 @@ The scheduler auto-config path was tested across the following checkpoints:
 | Ministral 3 3B Instruct 2512 | 3B | ✅ | `fix_mistral_regex=True` tokenizer compat may be required |
 | Doge-320M | 320M Tiny | ✅ | Remote-code revisions can require compat patching |
 | Llama 3.2 3B | 3B | ✅ | None observed |
-| Llama 3.2 3B Instruct (MI300X / ROCm 7.2) | 3B | ✅ | Use `attn_implementation="eager"` for BoL attention scan; set `pad_token_id=128001` explicitly |
+| Llama 3.2 3B Instruct (MI300X / ROCm 7.2) | 3B | ✅ | Use `attn_implementation="sdpa"` for training (41% faster); `eager` only for BoL attention scan. Set `pad_token_id=128001` explicitly. |
 | Gemma-4-E4B | ~4B (efficient) | ✅ | Text-only path may require `attn_implementation=\"eager\"` and explicit CUDA move |
 | Phi-4-mini-instruct | Mini | ✅ | Prefer native HF load (`trust_remote_code=False`) |
 | OLMo-2-0425-1B | 1B | ✅ | None observed |
@@ -221,7 +230,7 @@ tok.pad_token = tok.pad_token or tok.eos_token
 model = AutoModelForCausalLM.from_pretrained(
     MODEL,
     torch_dtype=torch.bfloat16,
-    attn_implementation="eager",             # MI300X / ROCm 7.2: eager unblocks BoL attention-map scan
+    attn_implementation="sdpa",              # MI300X / ROCm 7.2: dispatches to Triton fused HIP flash-attn — 41% faster than eager
 )
 model.config.use_cache = False
 model.config.pad_token_id = 128001
@@ -248,9 +257,11 @@ trainer = SFTTrainer(
         learning_rate=2e-5,
         bf16=True,
         max_seq_length=8192,
+        packing=False,                       # see Known Pitfalls — needs real flash_attn to be safe
         assistant_only_loss=True,
         gradient_checkpointing=True,
         gradient_checkpointing_kwargs={"use_reentrant": False},
+        optim="adamw_torch_fused",           # small free gain on MI300X
         seed=42,
     ),
     train_dataset=load_dataset("json", data_files="your_data.jsonl", split="train"),
@@ -261,10 +272,24 @@ trainer.train()
 dc.remove()
 ```
 
-Why `attn_implementation="eager"` on MI300X: SDPA on the current ROCm 7.2 stack
-silently disables `output_attentions=True`, which the BoL `attention_map` scan
-relies on. Eager works correctly with no measurable throughput hit on MI300X for
-3B-class models.
+### MI300X / ROCm 7.2 speed stack
+
+| Setting | Effect |
+|---|---|
+| `attn_implementation="sdpa"` | **Single biggest win — 41% faster epochs (17 min → 10 min on Llama-3.2-3B-Instruct).** Triton 3.6.0 + ROCm's HIP flash-attn headers are pre-installed on the DigitalOcean GPU droplet image, so SDPA dispatches to fused Triton kernels with no extra install. |
+| `optim="adamw_torch_fused"` | Small free gain over `adamw_torch`. |
+| `TORCH_BLAS_PREFER_HIPBLASLT=1` (env var) | Prefer hipBLASLt for matrix kernels. Set in shell before launching python. |
+| `packing=False` | Required without a real `flash_attn` package — see Known Pitfalls. |
+
+The DO ROCm 7.2 droplet has `triton==3.6.0`, `triton-rocm==3.6.0`, and the HIP
+flash-attn headers inside torch itself (`torch/include/ATen/native/transformers/hip/flash_attn`).
+There's no `flash_attn` pip package installed; getting one would require a
+20–40 minute build from source. Until that's done, SDPA via Triton is the fast path.
+
+If you specifically need BoL's `attention_map` scan (which requires
+`output_attentions=True`), switch to `attn_implementation="eager"` for that run
+only — SDPA on this stack silently returns `None` for attention weights. Use
+SDPA for training, eager for diagnostics.
 
 ---
 
@@ -387,7 +412,9 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 
 - **AMD: pip silently swaps your ROCm torch for a CUDA one.** Default `pip install git+...` resolves the project's `install_requires`, sees `torch`, and helpfully installs the CUDA build on top of your ROCm wheels. Always use `--no-deps --no-cache-dir` on AMD environments (see Install section). To verify: `python -c "import torch; print(torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_name(0))"`. Expect `7.2`, `True`, `AMD Instinct MI300X VF`.
 
-- **MI300X / ROCm 7.2: SDPA disables `output_attentions`.** `attn_implementation="sdpa"` runs forward correctly but silently returns `None` for attention weights, which makes the BoL `attention_map` scan fail or return empty. Use `attn_implementation="eager"` on MI300X. Throughput cost is negligible on 3B-class models in bf16.
+- **MI300X / ROCm 7.2: SDPA silently returns `None` for `output_attentions`.** `attn_implementation="sdpa"` is the fast path (41% epoch-time win on the DO droplet's Triton+HIP stack) but the ROCm SDPA kernel does not surface attention weights, so any code path that reads them — including BoL's `attention_map` scan — gets `None`. Use SDPA for training; switch to `attn_implementation="eager"` only when you want the attention scan to populate.
+
+- **MI300X / ROCm 7.2: `packing=True` is unsafe without a real `flash_attn` package.** The droplet has Triton-fused HIP attention via SDPA but no `flash_attn` wheel (it would need a 20–40 min source build). With packing enabled: `eager` OOMs around 22 GB on the packed-sequence softmax for 8 K context, and `sdpa` raises a warning and risks cross-example contamination because the masked-attention path needed for packing isn't fully implemented in the ROCm SDPA backend. Keep `packing=False` until a flash-attn build is ready. Estimated headroom once it's installed: another 15–25% on top of SDPA's gain.
 
 - **Llama-3 tokenizer warnings on Llama-3.2 / 3.3.** The default tokenizer has BOS/PAD/EOS overlap that triggers a noisy warning during training. Set `tokenizer.pad_token_id = 128001` (the EOT token) explicitly, and mirror it onto `model.config.pad_token_id` and `model.generation_config.pad_token_id`. Also null out `generation_config.temperature` / `top_p` / `do_sample` if you're not generating during training to silence the invalid-generation-flag warning.
 
