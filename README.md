@@ -4,11 +4,40 @@ A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre
 
 ## Install
 
+### CUDA / generic
+
 ```bash
 pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
 ```
 
-Dependencies: `torch`, `transformers`. Optional: `wandb` (integration currently not ready), `peft` (required for quantized models), `scipy` (used in silhouette scan).
+### AMD MI300X / ROCm 7.2
+
+```bash
+# 1. Purge any NVIDIA / CUDA torch wheels that snuck in
+pip uninstall -y torch torchvision torchaudio nvidia-cuda-runtime-cu12 \
+    nvidia-cublas-cu12 nvidia-cudnn-cu12 || true
+
+# 2. Install the ROCm 7.2 PyTorch wheels
+pip install --break-system-packages --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/rocm7.2 \
+    torch==2.11.0 torchvision torchaudio
+
+# 3. Install lucky-pick-scheduler WITHOUT touching torch
+pip install --break-system-packages --no-deps --no-cache-dir \
+    git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
+```
+
+`--no-deps` is critical on AMD — without it pip can helpfully reinstall a CUDA torch
+wheel and silently break your environment. To pull updates after setup:
+
+```bash
+cd lucky-pick-scheduler && git fetch origin && git reset --hard origin/main && \
+    pip install --no-deps .
+```
+
+### Dependencies
+
+`torch`, `transformers`. Optional: `wandb` (full integration via `bol_wandb`), `peft` (required for quantized models), `scipy` (used in silhouette scan), `trl` (recommended trainer wrapper).
 
 ---
 
@@ -65,6 +94,7 @@ The scheduler auto-config path was tested across the following checkpoints:
 | Ministral 3 3B Instruct 2512 | 3B | ✅ | `fix_mistral_regex=True` tokenizer compat may be required |
 | Doge-320M | 320M Tiny | ✅ | Remote-code revisions can require compat patching |
 | Llama 3.2 3B | 3B | ✅ | None observed |
+| Llama 3.2 3B Instruct (MI300X / ROCm 7.2) | 3B | ✅ | Use `attn_implementation="eager"` for BoL attention scan; set `pad_token_id=128001` explicitly |
 | Gemma-4-E4B | ~4B (efficient) | ✅ | Text-only path may require `attn_implementation=\"eager\"` and explicit CUDA move |
 | Phi-4-mini-instruct | Mini | ✅ | Prefer native HF load (`trust_remote_code=False`) |
 | OLMo-2-0425-1B | 1B | ✅ | None observed |
@@ -161,6 +191,80 @@ If you need to lock the current topology in place (for a probe or eval mid-run):
 ```python
 dc.freeze_topology(global_step)
 ```
+
+---
+
+## Using with TRL + plain transformers (recommended on AMD)
+
+This is the cleanest path on MI300X / ROCm 7.2 — no unsloth, no xformers, no
+CUDA-specific dependencies.
+
+```python
+import torch
+from datasets import load_dataset
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
+from trl import SFTConfig, SFTTrainer
+
+from lucky_pick_scheduler import (
+    DeepChaosConfig, DeepChaosScheduler, patch_clip_grad_norm_disable_foreach,
+)
+
+MODEL = "meta-llama/Llama-3.2-3B-Instruct"
+
+# Codified from the gemma-4 PDE-fault incident — also a no-op safety net on AMD.
+patch_clip_grad_norm_disable_foreach()
+
+tok = AutoTokenizer.from_pretrained(MODEL)
+tok.pad_token_id = 128001                    # explicit Llama-3 EOT, kills PAD/BOS/EOS warning
+tok.pad_token = tok.pad_token or tok.eos_token
+
+model = AutoModelForCausalLM.from_pretrained(
+    MODEL,
+    torch_dtype=torch.bfloat16,
+    attn_implementation="eager",             # MI300X / ROCm 7.2: eager unblocks BoL attention-map scan
+)
+model.config.use_cache = False
+model.config.pad_token_id = 128001
+model.generation_config.pad_token_id = 128001
+model.generation_config.temperature = None   # avoid invalid-flag warnings
+model.generation_config.top_p = None
+model.generation_config.do_sample = False
+model.gradient_checkpointing_enable()
+model.enable_input_require_grads()
+
+dc = DeepChaosScheduler(model, DeepChaosConfig(sticky_interval=50, seed=42))
+
+class DCStep(TrainerCallback):
+    def on_step_begin(self, args, state, control, **kw):
+        dc.step(state.global_step)
+
+trainer = SFTTrainer(
+    model=model,
+    args=SFTConfig(
+        output_dir="./out",
+        num_train_epochs=3,
+        per_device_train_batch_size=8,
+        gradient_accumulation_steps=1,
+        learning_rate=2e-5,
+        bf16=True,
+        max_seq_length=8192,
+        assistant_only_loss=True,
+        gradient_checkpointing=True,
+        gradient_checkpointing_kwargs={"use_reentrant": False},
+        seed=42,
+    ),
+    train_dataset=load_dataset("json", data_files="your_data.jsonl", split="train"),
+    processing_class=tok,
+    callbacks=[DCStep()],
+)
+trainer.train()
+dc.remove()
+```
+
+Why `attn_implementation="eager"` on MI300X: SDPA on the current ROCm 7.2 stack
+silently disables `output_attentions=True`, which the BoL `attention_map` scan
+relies on. Eager works correctly with no measurable throughput hit on MI300X for
+3B-class models.
 
 ---
 
@@ -280,6 +384,12 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 - **Debugging async CUDA faults.** The default async CUDA dispatcher surfaces errors at the next sync op, which may be far from the real faulting kernel. For any `illegal memory access` chase, set `CUDA_LAUNCH_BLOCKING=1` in the container env so the traceback points at the real line.
 
 - **Modal image layer caches a stale scheduler SHA.** `modal.Image.run_commands(...)` hashes the command string for caching. If a pip-install-from-git refuses to update after you push a new SHA, bust the cache with an explicit token in the command string: `"echo 'lps-rev=<date>-<sha>' && pip install ... @<sha>"`. Bump the token whenever you push.
+
+- **AMD: pip silently swaps your ROCm torch for a CUDA one.** Default `pip install git+...` resolves the project's `install_requires`, sees `torch`, and helpfully installs the CUDA build on top of your ROCm wheels. Always use `--no-deps --no-cache-dir` on AMD environments (see Install section). To verify: `python -c "import torch; print(torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_name(0))"`. Expect `7.2`, `True`, `AMD Instinct MI300X VF`.
+
+- **MI300X / ROCm 7.2: SDPA disables `output_attentions`.** `attn_implementation="sdpa"` runs forward correctly but silently returns `None` for attention weights, which makes the BoL `attention_map` scan fail or return empty. Use `attn_implementation="eager"` on MI300X. Throughput cost is negligible on 3B-class models in bf16.
+
+- **Llama-3 tokenizer warnings on Llama-3.2 / 3.3.** The default tokenizer has BOS/PAD/EOS overlap that triggers a noisy warning during training. Set `tokenizer.pad_token_id = 128001` (the EOT token) explicitly, and mirror it onto `model.config.pad_token_id` and `model.generation_config.pad_token_id`. Also null out `generation_config.temperature` / `top_p` / `do_sample` if you're not generating during training to silence the invalid-generation-flag warning.
 
 ---
 
@@ -431,90 +541,65 @@ print(report.to_dict())
 
 ---
 
-## BoL Scans
+## BoL Scans — Neural Network Pre/Post Diagnostics
 
-BoL (Blocks of Life) is the diagnostic suite. It runs six scans against a loaded model and tokenizer and logs everything to your active W&B run. The point is to snapshot the model before and after training so you can see concretely what changed.
-
-### Usage
-
-```python
-import wandb
-from bol_scans import run_all
-
-wandb.init(project="my-project", name="run-name")
-
-# before training
-run_all(model, tokenizer, phase="pre")
-
-trainer.train()
-
-# after training
-run_all(model, tokenizer, phase="post")
-```
-
-All metrics are logged under `pre/*` and `post/*` key prefixes in W&B.
+> If you've read this far and want to see what's actually happening inside the network during training, here's a bonus: BoL (Blocks of Life) runs a full diagnostic suite before and after fine-tuning and prints everything to your terminal. GPU required. Most people skip this section — it's here if you want it.
 
 ### The six scans
 
 **Weight Fingerprint**
-Per-layer, per-component weight statistics: mean, std, L2 norm, sparsity, and kurtosis for every projection group (q/k/v/o, gate/up/down). Gives you a direct before/after diff of what the optimizer actually changed and by how much in each part of the network.
+Per-layer, per-component weight statistics: mean, std, L2 norm, and sparsity for every projection group (q/k/v/o, gate/up/down). Gives you a direct before/after diff of what the optimizer actually changed.
 
 **Layer Sweep**
-Progressively zeroes out each layer from the top down and measures how much generation output changes. Shows which layers carry the most load and which the model is barely using.
+Progressively zeroes out each layer and measures generation damage. Shows which layers carry the most load and which the model barely uses.
 
 **Component Ablation**
-Zeroes out one projection type at a time (all Q projections, all V projections, all gate projections, etc.) across the full model and measures the perplexity hit. Shows relative importance of each projection family.
+Zeroes out one projection type at a time across the full model and measures the perplexity hit. Shows relative importance of each projection family.
 
 **Silhouette**
-Extracts hidden-state representations for semantically related and unrelated word pairs, then computes a silhouette score measuring how well the model separates them in representation space. A score closer to 1.0 means tighter clustering of related concepts; a score near 0 means the representations are poorly separated.
+Extracts hidden-state representations for related and unrelated word pairs, then computes a silhouette score measuring how well the model separates them. Closer to 1.0 = tighter clustering.
 
 **CKA (Centered Kernel Alignment)**
-Computes pairwise representational similarity between every layer combination using a fixed set of semantic probe words. Produces a heatmap showing which layers have converged to similar representations and which are doing meaningfully different things.
+Computes pairwise representational similarity across all layers. Shows which layers have converged to similar representations and which are doing different things.
 
 **Attention Map**
-Measures per-head attention entropy and cross-token similarity for each layer. Low entropy heads are attending sharply to specific tokens; high entropy heads are diffuse. Also measures consistency of attention patterns across similar inputs.
+Per-head attention entropy and cross-token similarity for each layer. Low entropy = focused attention, high = diffuse.
 
-### Custom eval texts and probes
-
-All six scans accept custom inputs:
+### Usage
 
 ```python
-run_all(
-    model,
-    tokenizer,
-    phase="pre",
-    eval_texts=["your text here", "another example"],
-    probes=["The capital of France is", "def fibonacci(n):"],
-    related_pairs=[("dog", "wolf"), ("happy", "joyful")],
-    unrelated_pairs=[("dog", "democracy"), ("happy", "concrete")],
-    cluster_words=["dog", "wolf", "car", "truck", "happy", "joy"],
-    clusters={
-        "animals": ["dog", "wolf"],
-        "vehicles": ["car", "truck"],
-        "emotions": ["happy", "joy"],
-    },
-    layer_stride=2,   # skip every other layer for faster CKA on large models
-)
-```
-
-### TrainerCallback (HuggingFace / Unsloth / TRL)
-
-`BoLWandbCallback` in `bol_wandb` handles the pre/post timing automatically:
-
-```python
-from bol_wandb import BoLWandbCallback
+from bol_wandb import BoLPrintCallback
 
 trainer = SFTTrainer(
     model=model,
     tokenizer=tokenizer,
     train_dataset=dataset,
     args=training_args,
-    callbacks=[BoLWandbCallback(model, tokenizer)],
+    callbacks=[BoLPrintCallback(model, tokenizer)],
 )
 trainer.train()
 ```
 
-The callback fires `run_all(..., phase="pre")` on `on_train_begin` and `run_all(..., phase="post")` on `on_train_end`. W&B must be initialized before the trainer starts.
+Fires `run_all(..., phase="pre")` at train start and `run_all(..., phase="post")` at train end, printing all six scans as readable terminal tables. No W&B required. Pre/post results are also stored on the callback instance for programmatic access.
+
+### Standalone
+
+```python
+from bol_scans import run_all
+
+# verbose=True prints the full bol-tools-v2 CLI render (fingerprint table,
+# layer sweep with CRITICAL/MODERATE/REMOVABLE tags, ranked importance,
+# silhouette ASCII bars, CKA, attention map) to stdout.
+pre_results  = run_all(model, tokenizer, phase="pre",  verbose=True)
+trainer.train()
+post_results = run_all(model, tokenizer, phase="post", verbose=True)
+```
+
+If you only want the compact one-liners (good for log scraping), use
+`print_summary=True` instead of `verbose=True`. The full render is also
+available as a string via `format_results_for_cli(results, phase=phase)`.
+
+All six scans accept custom `eval_texts`, `probes`, `related_pairs`, `unrelated_pairs`, `cluster_words`, `clusters`, and `layer_stride` (skip layers for faster CKA on large models).
 
 ---
 
@@ -529,8 +614,8 @@ lucky-pick-scheduler/
 │   ├── model_prep.py       # prepare_model_for_training, auto-LoRA for quantized checkpoints
 │   └── compat.py           # apply_transformers_remote_code_compat
 ├── bol_wandb/
-│   ├── callback.py         # BoLWandbCallback (TrainerCallback)
-│   └── config.py           # shared eval text and probe defaults
+│   ├── callback.py         # BoLPrintCallback (TrainerCallback)
+│   └── scanner.py          # BOLScanner helper
 ├── bol_scans.py            # run_all() — the six scans + W&B logging
 └── setup.py
 ```
