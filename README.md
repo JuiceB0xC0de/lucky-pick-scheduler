@@ -39,10 +39,15 @@ Before launching training, set:
 
 ```bash
 export TORCH_BLAS_PREFER_HIPBLASLT=1
+export HIP_FORCE_DEV_KERNARG=1
 ```
 
-Tells the ROCm matmul dispatcher to prefer hipBLASLt over rocBLAS where it has
-a kernel — small but free throughput gain on MI300X.
+`TORCH_BLAS_PREFER_HIPBLASLT=1` tells the ROCm matmul dispatcher to prefer
+hipBLASLt over rocBLAS where it has a kernel. `HIP_FORCE_DEV_KERNARG=1` forces
+kernel arguments to live in device memory instead of being host-managed —
+both are small but free throughput gains on MI300X. Set them in the shell
+before launching python; setting them via `os.environ[...] = "1"` at the top
+of the script also works as long as it's before any torch import.
 
 ### Dependencies
 
@@ -291,9 +296,102 @@ If you specifically need BoL's `attention_map` scan (which requires
 only — SDPA on this stack silently returns `None` for attention weights. Use
 SDPA for training, eager for diagnostics.
 
----
+### AMD GPU telemetry (W&B logging via amdsmi)
 
-## Using with Unsloth
+W&B's built-in system-metrics reader gives you almost nothing useful on AMD —
+no per-step gfx activity, no hipBLAS clocks, no throttle status. The fix is to
+read straight from `amdsmi` (ships with the ROCm install) inside a
+`TrainerCallback` and log the values yourself. The callback below is the one
+used to produce the Lucky Pick benchmark dashboard on Qwen2.5-3B-Instruct + s1K
+(MI300X, ROCm 7.2):
+
+```python
+import torch
+import wandb
+from transformers import TrainerCallback
+
+try:
+    import amdsmi
+    amdsmi.amdsmi_init()
+    _amd_handles = amdsmi.amdsmi_get_processor_handles()
+    AMDSMI_OK = len(_amd_handles) > 0
+except Exception as e:
+    print(f"AMDSMI unavailable: {e}")
+    _amd_handles = []
+    AMDSMI_OK = False
+
+
+class AMDTelemetryCallback(TrainerCallback):
+    """Logs ROCm-native GPU telemetry to W&B every Trainer log step."""
+
+    def __init__(self, device_index=0):
+        self.device_index = device_index
+
+    def on_log(self, args, state, control, logs=None, **kwargs):
+        if not AMDSMI_OK or self.device_index >= len(_amd_handles):
+            return
+        try:
+            handle   = _amd_handles[self.device_index]
+            metrics  = amdsmi.amdsmi_get_gpu_metrics_info(handle)
+            activity = amdsmi.amdsmi_get_gpu_activity(handle)
+            clocks   = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.GFX)
+            mem_clk  = amdsmi.amdsmi_get_clock_info(handle, amdsmi.AmdSmiClkType.MEM)
+            total_mem = torch.cuda.get_device_properties(0).total_memory
+
+            payload = {
+                # VRAM — torch owns the context, ask torch
+                "gpu/vram_used_mb":     torch.cuda.memory_allocated(0) / 1024**2,
+                "gpu/vram_reserved_mb": torch.cuda.memory_reserved(0) / 1024**2,
+                "gpu/vram_used_pct":    (torch.cuda.memory_allocated(0) / total_mem) * 100,
+
+                # Power
+                "gpu/power_w":          metrics.get("average_socket_power"),
+                "gpu/power_limit_w":    metrics.get("power_limit"),
+                "gpu/energy_acc_uj":    metrics.get("energy_accumulator"),
+
+                # Thermals
+                "gpu/temp_edge_c":      metrics.get("temperature_edge"),
+                "gpu/temp_hotspot_c":   metrics.get("temperature_hotspot"),
+                "gpu/temp_mem_c":       metrics.get("temperature_mem"),
+                "gpu/temp_vrgfx_c":     metrics.get("temperature_vrgfx"),
+
+                # Utilization
+                "gpu/gfx_util":         activity.get("gfx_activity"),
+                "gpu/mem_util":         activity.get("umc_activity"),
+
+                # Clocks
+                "gpu/gfx_clk_mhz":      clocks.get("clk"),
+                "gpu/gfx_clk_max_mhz":  clocks.get("max_clk"),
+                "gpu/mem_clk_mhz":      mem_clk.get("clk"),
+
+                # Throttle
+                "gpu/throttle_status":  metrics.get("throttle_status"),
+            }
+            payload = {
+                k: v for k, v in payload.items()
+                if v is not None and isinstance(v, (int, float))
+            }
+            if payload:
+                wandb.log(payload, step=state.global_step)
+        except Exception as e:
+            print(f"AMDSMI logging error: {e}")
+
+    def on_train_end(self, args, state, control, **kwargs):
+        try:
+            if AMDSMI_OK:
+                amdsmi.amdsmi_shut_down()
+        except Exception:
+            pass
+
+
+# trainer = SFTTrainer(..., callbacks=[AMDTelemetryCallback(), ChaosStepCallback()])
+```
+
+Why each metric matters:
+
+- `gpu/gfx_util` and `gpu/mem_util` distinguish "compute-bound" from "memory-bound" — chaos runs land lower because much of the layer stack is dead each window. If chaos runs match dense gfx_util, the scheduler isn't actually saving compute.
+- `gpu/temp_hotspot_c` and `gpu/throttle_status` tell you whether observed slowdowns are algorithmic or thermal. A 70 °C hotspot with throttle_status=0 is a healthy MI300X.
+- `gpu/gfx_clk_mhz` vs `gpu/gfx_clk_max_mhz` shows whether the GPU is actually running at boost or being held back by power/thermal envelope.
 
 The scheduler works with Unsloth's `FastLanguageModel` — load your model normally, wrap it in the scheduler, then call `dc.step()` in a custom training loop or via a `TrainerCallback`.
 
