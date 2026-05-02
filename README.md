@@ -49,6 +49,51 @@ both are small but free throughput gains on MI300X. Set them in the shell
 before launching python; setting them via `os.environ[...] = "1"` at the top
 of the script also works as long as it's before any torch import.
 
+### Local dev environment (venv, ROCm 6.2)
+
+For a local Linux rig with ROCm 6.2 where you want an isolated venv and a full
+Jupyter + W&B dev environment:
+
+```bash
+# 1. Create and activate venv
+python3 -m venv training-env
+source training-env/bin/activate
+
+# 2. Install PyTorch for ROCm
+pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm6.2
+
+# 3. Install Triton for ROCm (match your Python version, cp312 shown)
+pip install https://repo.radeon.com/rocm/manylinux/rocm-rel-7.2.2/triton-3.3.1%2Brocm7.2.2.git28a7371e-cp312-cp312-linux_x86_64.whl
+
+# 4. Install ML stack
+pip install transformers datasets trl accelerate wandb
+
+# 5. Install missing wandb deps
+pip install platformdirs pydantic
+
+# 6. Install Jupyter
+pip install notebook ipywidgets
+
+# 7. Clone and install lucky_pick_scheduler
+git clone https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
+cd lucky-pick-scheduler
+pip install -e .
+cd ..
+
+# 8. Login to W&B
+wandb login
+
+# 9. Launch Jupyter
+jupyter notebook --no-browser --port=8888 --ip=0.0.0.0 --allow-root
+```
+
+Set the ROCm env vars before launching training (same as the DO droplet setup):
+
+```bash
+export TORCH_BLAS_PREFER_HIPBLASLT=1
+export HIP_FORCE_DEV_KERNARG=1
+```
+
 ### Dependencies
 
 `torch`, `transformers`. Optional: `wandb` (full integration via `bol_wandb`), `peft` (required for quantized models), `scipy` (used in silhouette scan), `trl` (recommended trainer wrapper).
