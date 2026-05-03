@@ -13,19 +13,19 @@ fi
 echo "[setup] scratch disk mounted at /scratch"
 
 # Python stack
-pip install --upgrade pip setuptools wheel
+pip install --break-system-packages --upgrade pip setuptools wheel
 
 # Purge any CUDA/NVIDIA torch wheels that may have snuck in
 pip uninstall -y torch torchvision torchaudio \
     nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cudnn-cu12 2>/dev/null || true
 
 # PyTorch ROCm 7.2
-pip install --no-cache-dir \
+pip install --break-system-packages --no-cache-dir \
     --index-url https://download.pytorch.org/whl/rocm7.2 \
     torch==2.11.0 torchvision torchaudio
 
 # ML deps (no-deps on anything that might drag in a CUDA torch)
-pip install \
+pip install --break-system-packages \
     transformers>=4.51.0 \
     accelerate \
     trl \
@@ -40,7 +40,7 @@ pip install \
     peft
 
 # Deep Chaos Scheduler — install without deps so pip can't clobber the ROCm torch
-pip install --no-deps --no-cache-dir \
+pip install --break-system-packages --no-deps --no-cache-dir \
     git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
 
 # ROCm env vars — set here so they're available for the rest of the session
