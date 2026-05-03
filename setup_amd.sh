@@ -1,7 +1,7 @@
 #!/bin/bash
 set -e
 
-# AMD MI300X droplet setup — PyTorch 2.6.0 - ROCm 7.0 (Ubuntu 24.04)
+# AMD MI300X droplet setup — PyTorch 2.11.0 / ROCm 7.2 (Ubuntu 24.04)
 
 # Mount NVMe scratch disk
 mkdir -p /scratch
@@ -15,10 +15,16 @@ echo "[setup] scratch disk mounted at /scratch"
 # Python stack
 pip install --upgrade pip setuptools wheel
 
-# PyTorch ROCm 7.0
-pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/rocm7.0
+# Purge any CUDA/NVIDIA torch wheels that may have snuck in
+pip uninstall -y torch torchvision torchaudio \
+    nvidia-cuda-runtime-cu12 nvidia-cublas-cu12 nvidia-cudnn-cu12 2>/dev/null || true
 
-# ML deps
+# PyTorch ROCm 7.2
+pip install --no-cache-dir \
+    --index-url https://download.pytorch.org/whl/rocm7.2 \
+    torch==2.11.0 torchvision torchaudio
+
+# ML deps (no-deps on anything that might drag in a CUDA torch)
 pip install \
     transformers>=4.51.0 \
     accelerate \
@@ -29,14 +35,19 @@ pip install \
     hf_transfer \
     scipy \
     numpy \
-    tqdm
+    tqdm \
+    wandb \
+    peft
 
-# Unsloth AMD (supports MI300X as of April 2026)
-pip install unsloth
+# Deep Chaos Scheduler — install without deps so pip can't clobber the ROCm torch
+pip install --no-deps --no-cache-dir \
+    git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
 
-# Lucky Pick Scheduler from GitHub
-pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
+# ROCm env vars — set here so they're available for the rest of the session
+export TORCH_BLAS_PREFER_HIPBLASLT=1
+export HIP_FORCE_DEV_KERNARG=1
 
 echo "[setup] all dependencies installed"
+echo "[setup] ROCm env vars set (TORCH_BLAS_PREFER_HIPBLASLT=1, HIP_FORCE_DEV_KERNARG=1)"
 echo "[setup] verify PyTorch ROCm:"
-python -c "import torch; print(f'  torch={torch.__version__}  cuda/hip={torch.cuda.is_available()}  device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}')"
+python -c "import torch; print(f'  torch={torch.__version__}  hip={torch.cuda.is_available()}  device={torch.cuda.get_device_name(0) if torch.cuda.is_available() else \"none\"}')"

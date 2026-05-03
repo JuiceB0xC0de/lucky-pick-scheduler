@@ -76,7 +76,7 @@ def apply_transformers_remote_code_compat(*, verbose: bool = True) -> List[str]:
         applied.append("modeling_utils.mark_tied_weights_as_initialized")
 
     if verbose and applied:
-        print(f"[lucky_pick_scheduler.compat] Applied patches: {', '.join(applied)}")
+        print(f"[deep_chaos_scheduler.compat] Applied patches: {', '.join(applied)}")
     return applied
 
 
@@ -159,9 +159,9 @@ def allow_quantized_training_in_trainer(*, verbose: bool = True) -> List[str]:
         pass
 
     if verbose and applied:
-        print(f"[lucky_pick_scheduler.compat] Patched trainer validation: {', '.join(applied)}")
+        print(f"[deep_chaos_scheduler.compat] Patched trainer validation: {', '.join(applied)}")
     elif verbose:
-        print("[lucky_pick_scheduler.compat] Trainer validation already patched (idempotent).")
+        print("[deep_chaos_scheduler.compat] Trainer validation already patched (idempotent).")
 
     return applied
 
@@ -192,7 +192,7 @@ def patch_clip_grad_norm_disable_foreach(*, verbose: bool = True) -> bool:
 
     if getattr(torch.nn.utils.clip_grad_norm_, "_lps_disabled_foreach", False):
         if verbose:
-            print("[lucky_pick_scheduler.compat] clip_grad_norm_ foreach already disabled.")
+            print("[deep_chaos_scheduler.compat] clip_grad_norm_ foreach already disabled.")
         return False
 
     _orig = torch.nn.utils.clip_grad_norm_
@@ -219,11 +219,11 @@ def patch_clip_grad_norm_disable_foreach(*, verbose: bool = True) -> bool:
         _accel_mod.torch.nn.utils.clip_grad_norm_ = _clip_grad_norm_no_foreach
     except Exception as exc:
         if verbose:
-            print(f"[lucky_pick_scheduler.compat] accelerate patch skipped: {exc}")
+            print(f"[deep_chaos_scheduler.compat] accelerate patch skipped: {exc}")
 
     if verbose:
         print(
-            "[lucky_pick_scheduler.compat] Patched clip_grad_norm_ -> foreach=False "
+            "[deep_chaos_scheduler.compat] Patched clip_grad_norm_ -> foreach=False "
             "(A100 _foreach_norm XID-31 workaround)."
         )
     return True

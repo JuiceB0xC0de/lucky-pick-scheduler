@@ -338,7 +338,7 @@ def apply_bitnet_linear_replacement(
             model is trainable, but transformers still sees
             ``quantization_method = BITNET`` and blocks the Trainer.  This patch
             is the same as calling
-            ``lucky_pick_scheduler.compat.allow_quantized_training_in_trainer()``
+            ``deep_chaos_scheduler.compat.allow_quantized_training_in_trainer()``
             manually.  Set to False if you want to manage the patch yourself.
 
     Raises:
@@ -354,7 +354,7 @@ def apply_bitnet_linear_replacement(
 
     model = replace_linear_with_bitnet_linear(model)
     if verbose:
-        print("[lucky_pick_scheduler] BitLinear replacement applied (onebitllms).")
+        print("[deep_chaos_scheduler] BitLinear replacement applied (onebitllms).")
 
     if patch_trainer_validation:
         try:
@@ -362,13 +362,13 @@ def apply_bitnet_linear_replacement(
             patched = allow_quantized_training_in_trainer(verbose=verbose)
             if verbose and patched:
                 print(
-                    "[lucky_pick_scheduler] Patched trainer quantization validation "
+                    "[deep_chaos_scheduler] Patched trainer quantization validation "
                     "(BitNet model is trainable after replace_linear_with_bitnet_linear)."
                 )
         except Exception as exc:  # pragma: no cover
             warnings.warn(
-                f"[lucky_pick_scheduler] Could not patch trainer validation: {exc}\n"
-                "Call lucky_pick_scheduler.compat.allow_quantized_training_in_trainer() "
+                f"[deep_chaos_scheduler] Could not patch trainer validation: {exc}\n"
+                "Call deep_chaos_scheduler.compat.allow_quantized_training_in_trainer() "
                 "manually before constructing your Trainer.",
                 UserWarning,
                 stacklevel=2,
@@ -394,7 +394,7 @@ def prepare_model_for_training(
         model = model.float()
         if cfg.verbose:
             print(
-                "[lucky_pick_scheduler] Phi-MoE detected; cast model to float32 "
+                "[deep_chaos_scheduler] Phi-MoE detected; cast model to float32 "
                 "for grouped_mm dtype consistency."
             )
 
@@ -413,7 +413,7 @@ def prepare_model_for_training(
         if model_id:
             bitnet_path = f"{model_id} (revision='prequantized')"
         warnings.warn(
-            f"\n\n[lucky_pick_scheduler] BitNet model detected.\n"
+            f"\n\n[deep_chaos_scheduler] BitNet model detected.\n"
             f"{_BITNET_PREQUANTIZED_HINT}",
             UserWarning,
             stacklevel=2,

@@ -1,9 +1,9 @@
 from setuptools import setup, find_packages
 
 setup(
-    name="lucky_pick_scheduler",
+    name="deep_chaos_scheduler",
     version="0.1.0",
-    description="Trainer-agnostic BoL scan suite with W&B logging",
+    description="Sticky-topology chaos scheduler for transformer fine-tuning, with BoL diagnostic scans",
     author="juiceb0xc0de",
     license="MIT",
     packages=find_packages(),

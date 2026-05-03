@@ -4,7 +4,7 @@ from typing import List, Tuple
 
 import torch
 
-from lucky_pick_scheduler import resolve_transformer_layers
+from deep_chaos_scheduler import resolve_transformer_layers
 
 
 def resolve_decoder_layers(model: torch.nn.Module) -> List[Tuple[int, str, torch.nn.Module]]:

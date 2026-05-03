@@ -23,7 +23,7 @@ from typing import Any, Dict, Iterable, List, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from lucky_pick_scheduler import resolve_transformer_layers
+from deep_chaos_scheduler import resolve_transformer_layers
 
 try:
     import wandb

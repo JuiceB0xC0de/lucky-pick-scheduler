@@ -1,4 +1,4 @@
-# lucky-pick-scheduler
+# deep-chaos-scheduler
 
 A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre/post training neural network diagnostic suite (BoL scans).
 
@@ -7,7 +7,7 @@ A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre
 ### CUDA / generic
 
 ```bash
-pip install git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
+pip install git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
 ```
 
 ### AMD MI300X / ROCm 7.2
@@ -22,16 +22,16 @@ pip install --break-system-packages --no-cache-dir \
     --index-url https://download.pytorch.org/whl/rocm7.2 \
     torch==2.11.0 torchvision torchaudio
 
-# 3. Install lucky-pick-scheduler WITHOUT touching torch
+# 3. Install deep-chaos-scheduler WITHOUT touching torch
 pip install --break-system-packages --no-deps --no-cache-dir \
-    git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
+    git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
 ```
 
 `--no-deps` is critical on AMD — without it pip can helpfully reinstall a CUDA torch
 wheel and silently break your environment. To pull updates after setup:
 
 ```bash
-cd lucky-pick-scheduler && git fetch origin && git reset --hard origin/main && \
+cd deep-chaos-scheduler && git fetch origin && git reset --hard origin/main && \
     pip install --no-deps .
 ```
 
@@ -74,9 +74,9 @@ pip install platformdirs pydantic
 # 6. Install Jupyter
 pip install notebook ipywidgets
 
-# 7. Clone and install lucky_pick_scheduler
-git clone https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git
-cd lucky-pick-scheduler
+# 7. Clone and install deep_chaos_scheduler
+git clone https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
+cd deep-chaos-scheduler
 pip install -e .
 cd ..
 
@@ -172,7 +172,7 @@ No permanently unsupported model family is currently known, but highly custom re
 ### Minimal
 
 ```python
-from lucky_pick_scheduler import DeepChaosScheduler, DeepChaosConfig
+from deep_chaos_scheduler import DeepChaosScheduler, DeepChaosConfig
 
 # model is already loaded (Unsloth, HF, PEFT, anything)
 dc = DeepChaosScheduler(
@@ -264,7 +264,7 @@ from datasets import load_dataset
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from trl import SFTConfig, SFTTrainer
 
-from lucky_pick_scheduler import (
+from deep_chaos_scheduler import (
     DeepChaosConfig, DeepChaosScheduler, patch_clip_grad_norm_disable_foreach,
 )
 
@@ -444,7 +444,7 @@ The scheduler works with Unsloth's `FastLanguageModel` — load your model norma
 
 ```python
 from unsloth import FastLanguageModel
-from lucky_pick_scheduler import DeepChaosScheduler, DeepChaosConfig
+from deep_chaos_scheduler import DeepChaosScheduler, DeepChaosConfig
 
 model, tokenizer = FastLanguageModel.from_pretrained(
     "unsloth/llama-3.2-3b-instruct",
@@ -461,7 +461,7 @@ model = FastLanguageModel.get_peft_model(
     bias="none",
 )
 
-from lucky_pick_scheduler import resolve_scheduler_model
+from deep_chaos_scheduler import resolve_scheduler_model
 dc = DeepChaosScheduler(
     resolve_scheduler_model(model),   # unwraps PEFT wrapper for hook installation
     DeepChaosConfig(sticky_interval=50),
@@ -484,7 +484,7 @@ dc.remove()
 
 ```python
 from unsloth import FastLanguageModel
-from lucky_pick_scheduler import DeepChaosScheduler, DeepChaosConfig, resolve_scheduler_model
+from deep_chaos_scheduler import DeepChaosScheduler, DeepChaosConfig, resolve_scheduler_model
 from trl import SFTTrainer, SFTConfig
 from transformers import TrainerCallback
 
@@ -540,7 +540,7 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 - **`CUDA error: an illegal memory access` inside `clip_grad_norm_` on A100.** Traceback lands in `torch._foreach_norm(device_grads, norm_type)`, usually with `XID 31 ... MMU Fault ... FAULT_PDE ACCESS_TYPE_VIRT_READ` in the NVIDIA log. Not a NaN/Inf bug — grads are clean. The fused `_foreach_norm` kernel trips a PDE MMU fault on some A100 + CUDA 12.1 + PyTorch 2.5.1 combos (reproduced on Modal A100-80GB with Gemma-4 E4B). Fix by forcing the single-tensor loop:
 
   ```python
-  from lucky_pick_scheduler import patch_clip_grad_norm_disable_foreach
+  from deep_chaos_scheduler import patch_clip_grad_norm_disable_foreach
   patch_clip_grad_norm_disable_foreach()
   # then construct your Trainer / run trainer.train() as usual
   ```
@@ -570,7 +570,7 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 For scripts that load many model families, use the built-in helpers:
 
 ```python
-from lucky_pick_scheduler import (
+from deep_chaos_scheduler import (
     model_load_kwargs_for_training,
     resolve_training_precision,
     tokenizer_load_kwargs_for_model,
@@ -598,7 +598,7 @@ This includes:
 If your checkpoint is quantized and the trainer rejects full-parameter training, `prepare_model_for_training` auto-attaches LoRA adapters:
 
 ```python
-from lucky_pick_scheduler import ModelPrepConfig, prepare_model_for_training, resolve_scheduler_model
+from deep_chaos_scheduler import ModelPrepConfig, prepare_model_for_training, resolve_scheduler_model
 
 model, prep_report = prepare_model_for_training(
     model,
@@ -638,7 +638,7 @@ The correct path:
 ```python
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-from lucky_pick_scheduler import apply_bitnet_linear_replacement, DeepChaosScheduler, DeepChaosConfig
+from deep_chaos_scheduler import apply_bitnet_linear_replacement, DeepChaosScheduler, DeepChaosConfig
 
 model_id = "tiiuae/Falcon-E-3B-Instruct"  # or Falcon-E-1B-Base, Falcon-E-7B-Base, etc.
 
@@ -669,7 +669,7 @@ quantize_to_1bit(output_dir, quantized_output_dir)
 
 Requires `pip install onebitllms`. LoRA/PEFT is not currently supported for BitNet models — `apply_bitnet_linear_replacement` does full-parameter QAT using a straight-through estimator.
 
-> **Container note:** `pip install git+https://...` in a container image is cached at build time. If you push changes to this repo and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/lucky-pick-scheduler.git`
+> **Container note:** `pip install git+https://...` in a container image is cached at build time. If you push changes to this repo and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git`
 
 ---
 
@@ -678,7 +678,7 @@ Requires `pip install onebitllms`. LoRA/PEFT is not currently supported for BitN
 Some Hub models (certain Doge/Mistral remote-code revisions) have runtime mismatches across `transformers` versions. Apply the compatibility patch before loading:
 
 ```python
-from lucky_pick_scheduler import apply_transformers_remote_code_compat
+from deep_chaos_scheduler import apply_transformers_remote_code_compat
 
 apply_transformers_remote_code_compat(verbose=True)
 
@@ -692,7 +692,7 @@ apply_transformers_remote_code_compat(verbose=True)
 `build_scheduler_stack` introspects the model, groups parameters by role (attention, MLP, embedding, head, norm/bias), and builds an AdamW optimizer + LR scheduler automatically. Three param groups: matrix params (attention/mlp/other_matrix weights) can run at a different LR via `matrix_lr_multiplier`, norm and bias params get `weight_decay=0.0` by default, everything else runs at the base LR.
 
 ```python
-from lucky_pick_scheduler import build_scheduler_stack, AutoSchedulerConfig
+from deep_chaos_scheduler import build_scheduler_stack, AutoSchedulerConfig
 
 optimizer, lr_scheduler, report = build_scheduler_stack(
     model,
@@ -776,8 +776,8 @@ All six scans accept custom `eval_texts`, `probes`, `related_pairs`, `unrelated_
 ## File layout
 
 ```
-lucky-pick-scheduler/
-├── lucky_pick_scheduler/
+deep-chaos-scheduler/
+├── deep_chaos_scheduler/
 │   ├── __init__.py
 │   ├── deep_chaos.py       # DeepChaosScheduler, DeepChaosConfig, LayerBindings, topology logic
 │   ├── scheduler.py        # build_scheduler_stack, AutoSchedulerConfig, parameter role classification
