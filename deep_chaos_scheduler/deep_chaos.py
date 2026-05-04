@@ -181,6 +181,88 @@ class DeepChaosConfig:
     # When True, the post-hook path is NOT installed — hoist is the only
     # mechanism modifying the forward.
     use_layer_hoist: bool = False
+    # Hoist stub: tiny frozen perturbation inserted in place of contiguous
+    # yanked runs.  Without it, removing dead/identity/attn/mlp layers
+    # entirely makes adjacent surviving layers communicate directly when
+    # they were trained for an intervening transformation.  The stub is a
+    # graph-preserving "smoke screen": it touches the residual stream at
+    # the position the missing block used to occupy, so downstream layers
+    # see _some_ perturbation rather than raw upstream output.  One stub
+    # per contiguous yanked run (not per layer) — accumulated bias drift
+    # would otherwise compound across multi-layer runs.  Stubs are frozen
+    # at construction; the alive layers adapt to them during training.
+    #   "bias":    x -> x + b   (1 frozen vector per stub, recommended)
+    #   "linear":  x -> x + frozen_Linear(x)  (one frozen matmul per stub)
+    #   "none":    x -> x       (naked hoist, the residual collapse case)
+    hoist_stub_kind: str = "bias"
+    hoist_stub_init_scale: float = 0.01
+
+
+class HoistStub(torch.nn.Module):
+    """Frozen residual-stream perturbation that stands in for a contiguous
+    run of hoisted layers.
+
+    The stub does not learn.  Its only job is to ensure the residual stream
+    is touched at the position(s) the yanked block used to occupy, so the
+    next surviving layer doesn't suddenly receive the previous surviving
+    layer's output verbatim (which it was never trained to consume).  The
+    surviving layers ARE plastic during training and adapt to whatever the
+    stub outputs, as long as the stub is consistent across forward passes.
+
+    Stored weights use buffers (not Parameters) so the optimizer naturally
+    ignores them and they don't show up in `.parameters()`.
+
+    Forward signature is permissive: takes `hidden_states` as the first
+    positional arg and ignores all other args/kwargs (attention_mask,
+    position_ids, position_embeddings, past_key_values, ...).  Returns the
+    perturbed hidden_states as a plain Tensor — matches modern
+    `Qwen2DecoderLayer.forward` return convention.
+    """
+
+    def __init__(
+        self,
+        hidden_size: int,
+        kind: str = "bias",
+        init_scale: float = 0.01,
+        seed: int = 0,
+        dtype: torch.dtype | None = None,
+        device: torch.device | None = None,
+    ):
+        super().__init__()
+        if kind not in ("bias", "linear", "none"):
+            raise ValueError(f"Unknown hoist_stub_kind: {kind!r}")
+        self.kind = kind
+        self.hidden_size = int(hidden_size)
+        gen = torch.Generator().manual_seed(int(seed))
+        target_dtype = dtype or torch.float32
+        if kind == "bias":
+            b = torch.randn(self.hidden_size, generator=gen) * float(init_scale)
+            self.register_buffer("bias", b.to(dtype=target_dtype, device=device))
+        elif kind == "linear":
+            w = torch.randn(self.hidden_size, self.hidden_size, generator=gen) * float(init_scale)
+            b = torch.randn(self.hidden_size, generator=gen) * float(init_scale)
+            self.register_buffer("weight", w.to(dtype=target_dtype, device=device))
+            self.register_buffer("linear_bias", b.to(dtype=target_dtype, device=device))
+        # kind == "none": no buffers, forward is identity.
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        if self.kind == "bias":
+            bias = self.bias
+            if bias.dtype != hidden_states.dtype or bias.device != hidden_states.device:
+                bias = bias.to(dtype=hidden_states.dtype, device=hidden_states.device)
+            return hidden_states + bias
+        if self.kind == "linear":
+            w = self.weight
+            b = self.linear_bias
+            if w.dtype != hidden_states.dtype or w.device != hidden_states.device:
+                w = w.to(dtype=hidden_states.dtype, device=hidden_states.device)
+                b = b.to(dtype=hidden_states.dtype, device=hidden_states.device)
+            return hidden_states + torch.nn.functional.linear(hidden_states, w, b)
+        # kind == "none"
+        return hidden_states
+
+    def extra_repr(self) -> str:
+        return f"hidden_size={self.hidden_size}, kind={self.kind!r}"
 
 
 @dataclass
@@ -260,9 +342,14 @@ class DeepChaosScheduler:
         self._hoist_originals: List[torch.nn.Module] = []
         self._hoist_last_kept: List[int] = []
         self._hoist_last_yanked: List[int] = []
+        # One stub per original victim layer index, persistent across
+        # reshuffles.  Used at run-start positions; subsequent layers in
+        # the same contiguous yanked run reuse the run-start stub.
+        self._hoist_stubs: Dict[int, HoistStub] = {}
         if bool(getattr(config, "use_layer_hoist", False)):
             self._hoist_parent, self._hoist_attr = self._resolve_layers_parent(self.model)
             self._hoist_originals = list(getattr(self._hoist_parent, self._hoist_attr))
+            self._build_hoist_stubs()
 
         self._build_layer_bindings()
         # Hoist replaces the post-hook path entirely — they're mutually
@@ -310,12 +397,52 @@ class DeepChaosScheduler:
             "Could not locate transformer layers ModuleList parent for hoist."
         )
 
+    def _build_hoist_stubs(self) -> None:
+        """Instantiate one frozen HoistStub per victim layer index, sized
+        to that layer's hidden dim.  Called once at __init__ when
+        use_layer_hoist is True; stubs persist for the life of the
+        scheduler so the alive layers see consistent perturbations."""
+        kind = str(getattr(self.config, "hoist_stub_kind", "bias"))
+        if kind == "none" or not self._hoist_originals:
+            return
+        scale = float(getattr(self.config, "hoist_stub_init_scale", 0.01))
+        seed_base = int(getattr(self.config, "seed", 0))
+        # Infer hidden size + dtype from the model itself.
+        try:
+            sample_param = next(self.model.parameters())
+            target_dtype = sample_param.dtype
+            target_device = sample_param.device
+        except StopIteration:
+            target_dtype = torch.float32
+            target_device = self.layer_device
+        hidden_size = None
+        if self.bindings:
+            for binding in self.bindings.values():
+                if binding.hidden_size:
+                    hidden_size = int(binding.hidden_size)
+                    break
+        if hidden_size is None:
+            cfg = getattr(self.model, "config", None)
+            hidden_size = int(getattr(cfg, "hidden_size", 0)) if cfg is not None else 0
+        if not hidden_size:
+            return
+        for idx in self.victims:
+            self._hoist_stubs[idx] = HoistStub(
+                hidden_size=hidden_size,
+                kind=kind,
+                init_scale=scale,
+                seed=seed_base * 1_000_003 + idx,
+                dtype=target_dtype,
+                device=target_device,
+            )
+
     def _apply_layer_hoist_surgery(self) -> Tuple[int, int]:
         """Rebuild parent.layers to contain only sacred layers + victims in
-        mode=both.  Called from step() on every reshuffle event when
-        use_layer_hoist is True.
+        mode=both, with one HoistStub inserted at the start of every
+        contiguous run of yanked layers.  Called from step() on every
+        reshuffle event when use_layer_hoist is True.
 
-        Returns (kept_count, yanked_count).
+        Returns (kept_count, stub_count_or_yanked_count).
         """
         parent = self._hoist_parent
         attr = self._hoist_attr
@@ -324,17 +451,26 @@ class DeepChaosScheduler:
         kept_indices: List[int] = []
         yanked_indices: List[int] = []
         survivors: List[torch.nn.Module] = []
+        prev_yanked = False
         for idx, layer in enumerate(self._hoist_originals):
             if idx in self.sacred:
                 survivors.append(layer)
                 kept_indices.append(idx)
+                prev_yanked = False
                 continue
             topo = self.topologies.get(idx)
             if topo is None or topo.mode == "both":
                 survivors.append(layer)
                 kept_indices.append(idx)
+                prev_yanked = False
             else:
                 yanked_indices.append(idx)
+                if not prev_yanked:
+                    # First layer of a contiguous yanked run -> insert a stub.
+                    stub = self._hoist_stubs.get(idx)
+                    if stub is not None:
+                        survivors.append(stub)
+                prev_yanked = True
         setattr(parent, attr, torch.nn.ModuleList(survivors))
         self._hoist_last_kept = kept_indices
         self._hoist_last_yanked = yanked_indices
@@ -772,9 +908,19 @@ class DeepChaosScheduler:
             self.cached_stats["hoist_kept_layers"] = float(kept)
             self.cached_stats["hoist_yanked_layers"] = float(yanked)
             if bool(self.config.announce_reshuffles):
+                # Count contiguous yanked runs (= number of stubs inserted).
+                runs = 0
+                prev = -2
+                for i in sorted(self._hoist_last_yanked):
+                    if i != prev + 1:
+                        runs += 1
+                    prev = i
+                stub_kind = str(getattr(self.config, "hoist_stub_kind", "bias"))
                 print(
                     f"  layer hoist     : kept {kept} layer(s), yanked {yanked} "
-                    f"(yanked indices: {sorted(self._hoist_last_yanked)})"
+                    f"(yanked indices: {sorted(self._hoist_last_yanked)})\n"
+                    f"  stubs           : {runs} {stub_kind!r}-stub(s) "
+                    f"inserted at run starts"
                 )
         return self.cached_stats
 
