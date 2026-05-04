@@ -10,7 +10,7 @@ import wandb
 
 from transformers import set_seed
 
-SEED = 667
+SEED = 199
 set_seed(SEED)
 
 if torch.cuda.is_available():
@@ -19,9 +19,9 @@ if torch.cuda.is_available():
     print(f"VRAM: {free / 1024**3:.2f} GB free of {total / 1024**3:.2f} GB")
     print(f"ROCm: {torch.version.hip}")
 
-wandb.init(project="lucky-pick-benchmark", name=f"run-deepchaos-7b-{SEED}")
+wandb.init(project="lucky-pick-optimized", name=f"run-deepchaos-3b-{SEED}")
 
-model_id = "Qwen/Qwen2.5-7B-Instruct"
+model_id = "Qwen/Qwen2.5-3b-Instruct"
 
 from datasets import load_dataset
 
@@ -153,7 +153,7 @@ class AMDTelemetryCallback(TrainerCallback):
 
 
 sft_config = SFTConfig(
-    output_dir=f"./benchmark-deepchaos-7b-{SEED}",
+    output_dir=f"./benchmark-deepchaos-3b-{SEED}",
     num_train_epochs=5,
     per_device_train_batch_size=2,
     gradient_accumulation_steps=8,

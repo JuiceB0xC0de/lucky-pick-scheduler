@@ -198,6 +198,35 @@ class DeepChaosConfig:
     hoist_stub_init_scale: float = 0.01
 
 
+class _ZeroMLPStub(torch.nn.Module):
+    """Submodule stand-in for `layer.mlp` when topology mode is `attn`.
+
+    The Qwen2 / Llama-style decoder layer adds the MLP block as
+    `hidden_states = residual + self.mlp(post_attn_ln(hidden_states))`.
+    Returning `zeros_like(input)` makes the second residual a no-op while
+    keeping the attention contribution intact.  Stateless — one instance
+    can be shared across all layers using it.
+    """
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(hidden_states)
+
+
+class _ZeroAttnStub(torch.nn.Module):
+    """Submodule stand-in for `layer.self_attn` when topology mode is `mlp`.
+
+    Modern transformers `Qwen2Attention.forward` returns a tuple
+    `(attn_output, attn_weights)`.  Older versions and other architectures
+    may return just the tensor.  Return a tuple here — the layer's forward
+    is written as `hidden_states, _ = self.self_attn(...)`, which unpacks
+    the tuple cleanly.  If a caller expects a single tensor it'll error
+    loudly and we adapt.
+    """
+
+    def forward(self, hidden_states: torch.Tensor, *args, **kwargs):
+        return (torch.zeros_like(hidden_states), None)
+
+
 class HoistStub(torch.nn.Module):
     """Frozen residual-stream perturbation that stands in for a contiguous
     run of hoisted layers.
@@ -346,6 +375,15 @@ class DeepChaosScheduler:
         # reshuffles.  Used at run-start positions; subsequent layers in
         # the same contiguous yanked run reuse the run-start stub.
         self._hoist_stubs: Dict[int, HoistStub] = {}
+        # Submodule-swap state: per-layer original submodules and the set of
+        # attribute names currently swapped out for zero-return stubs.
+        # Used so each reshuffle can restore previous swaps before applying
+        # new ones, regardless of which mode each layer was in last time.
+        self._hoist_orig_submodules: Dict[int, Dict[str, torch.nn.Module]] = {}
+        self._hoist_active_swaps: Dict[int, set[str]] = {}
+        # Shared zero-return stubs — stateless, one instance per layer-half.
+        self._hoist_zero_mlp = _ZeroMLPStub()
+        self._hoist_zero_attn = _ZeroAttnStub()
         if bool(getattr(config, "use_layer_hoist", False)):
             self._hoist_parent, self._hoist_attr = self._resolve_layers_parent(self.model)
             self._hoist_originals = list(getattr(self._hoist_parent, self._hoist_attr))
@@ -436,18 +474,70 @@ class DeepChaosScheduler:
                 device=target_device,
             )
 
-    def _apply_layer_hoist_surgery(self) -> Tuple[int, int]:
-        """Rebuild parent.layers to contain only sacred layers + victims in
-        mode=both, with one HoistStub inserted at the start of every
-        contiguous run of yanked layers.  Called from step() on every
-        reshuffle event when use_layer_hoist is True.
+    def _restore_submodule_swaps(self) -> None:
+        """Reverse any per-layer submodule swaps from a prior surgery."""
+        for idx, attrs in self._hoist_active_swaps.items():
+            layer = self._hoist_originals[idx]
+            for attr in attrs:
+                orig = self._hoist_orig_submodules.get(idx, {}).get(attr)
+                if orig is not None:
+                    setattr(layer, attr, orig)
+        self._hoist_active_swaps.clear()
 
-        Returns (kept_count, stub_count_or_yanked_count).
+    def _swap_submodule(
+        self,
+        layer_idx: int,
+        attr_name: str,
+        stub_module: torch.nn.Module,
+    ) -> bool:
+        """Swap a single submodule attribute for a stub, recording the
+        original so it can be restored later.  Returns True if the swap
+        actually happened (the layer has the attribute and it isn't
+        already the stub)."""
+        layer = self._hoist_originals[layer_idx]
+        current = getattr(layer, attr_name, None)
+        if current is None:
+            return False
+        if current is stub_module:
+            return False
+        # Save original on first swap of this attr for this layer.
+        slot = self._hoist_orig_submodules.setdefault(layer_idx, {})
+        if attr_name not in slot:
+            slot[attr_name] = current
+        setattr(layer, attr_name, stub_module)
+        self._hoist_active_swaps.setdefault(layer_idx, set()).add(attr_name)
+        return True
+
+    def _apply_layer_hoist_surgery(self) -> Tuple[int, int]:
+        """Rebuild parent.layers based on per-layer topology mode.
+
+        Surgery rules:
+            - sacred:                        keep, no surgery
+            - mode=both / identity:          keep, no surgery
+                (identity in the post-hook path = layer's natural output —
+                yanking it would change behaviour the post-hook path didn't.)
+            - mode=attn:                     keep layer, swap layer.mlp -> zeros
+            - mode=mlp:                      keep layer, swap layer.self_attn -> zeros
+            - mode=dead:                     yank, insert bias-stub at run start
+                (post-hook path produces x->x in mode=dead because all 7
+                projections are zeroed — yanking is faithful to that.)
+
+        Each surgery first restores the previous shuffle's submodule swaps,
+        then applies fresh ones.  Bias stubs persist for the life of the
+        scheduler and are inserted only at the START of each contiguous
+        yanked run (avoids accumulated bias drift across multi-layer runs).
+
+        Returns (kept_count, yanked_count).
         """
         parent = self._hoist_parent
         attr = self._hoist_attr
         if parent is None or attr is None:
             return (0, 0)
+
+        # Step 1: restore any submodule swaps from the prior shuffle.
+        self._restore_submodule_swaps()
+
+        # Step 2: classify every original layer.
         kept_indices: List[int] = []
         yanked_indices: List[int] = []
         survivors: List[torch.nn.Module] = []
@@ -459,18 +549,35 @@ class DeepChaosScheduler:
                 prev_yanked = False
                 continue
             topo = self.topologies.get(idx)
-            if topo is None or topo.mode == "both":
+            mode = topo.mode if topo is not None else "both"
+
+            if mode in ("both", "identity"):
+                # Layer runs at full strength.
                 survivors.append(layer)
                 kept_indices.append(idx)
                 prev_yanked = False
-            else:
+            elif mode == "attn":
+                # Skip MLP only.  Swap layer.mlp -> zero stub.
+                self._swap_submodule(idx, "mlp", self._hoist_zero_mlp)
+                survivors.append(layer)
+                kept_indices.append(idx)
+                prev_yanked = False
+            elif mode == "mlp":
+                # Skip self-attention only.  Swap layer.self_attn -> zero stub.
+                # Some architectures use `attn` instead of `self_attn`; try both.
+                if not self._swap_submodule(idx, "self_attn", self._hoist_zero_attn):
+                    self._swap_submodule(idx, "attn", self._hoist_zero_attn)
+                survivors.append(layer)
+                kept_indices.append(idx)
+                prev_yanked = False
+            else:  # mode == "dead" (or anything else unrecognised)
                 yanked_indices.append(idx)
                 if not prev_yanked:
-                    # First layer of a contiguous yanked run -> insert a stub.
                     stub = self._hoist_stubs.get(idx)
                     if stub is not None:
                         survivors.append(stub)
                 prev_yanked = True
+
         setattr(parent, attr, torch.nn.ModuleList(survivors))
         self._hoist_last_kept = kept_indices
         self._hoist_last_yanked = yanked_indices
@@ -1008,12 +1115,14 @@ class DeepChaosScheduler:
             except Exception:
                 pass
         self.hook_handles.clear()
-        # Restore the original model.layers ModuleList if hoist was active.
+        # Restore submodule swaps + original model.layers ModuleList if
+        # hoist was active.
         if (
             self._hoist_parent is not None
             and self._hoist_attr is not None
             and self._hoist_originals
         ):
+            self._restore_submodule_swaps()
             setattr(
                 self._hoist_parent,
                 self._hoist_attr,
@@ -1022,6 +1131,7 @@ class DeepChaosScheduler:
             self._hoist_parent = None
             self._hoist_attr = None
             self._hoist_originals = []
+            self._hoist_orig_submodules.clear()
         self.topologies.clear()
         self.cached_stats = None
         self.last_shuffle_step = None
