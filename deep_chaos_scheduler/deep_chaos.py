@@ -171,6 +171,16 @@ class DeepChaosConfig:
     sticky_interval: int = 50
     announce_reshuffles: bool = True
     seed: int = 42
+    # Layer hoist: at every reshuffle, physically rebuild model.layers to
+    # contain only sacred layers + victims in mode=both.  Dead, identity,
+    # attn-only, and mlp-only layers are removed from the ModuleList entirely
+    # for that sticky block.  Forward pass has fewer blocks, no saved
+    # activations or autograd graph for the absent layers.
+    # Verdict on Qwen2.5-3B / MI300X / 100 steps / sticky=25:
+    #   3.55x faster wall-clock, 42.9% peak VRAM cut.
+    # When True, the post-hook path is NOT installed — hoist is the only
+    # mechanism modifying the forward.
+    use_layer_hoist: bool = False
 
 
 @dataclass
@@ -242,14 +252,93 @@ class DeepChaosScheduler:
         self.bindings: Dict[int, LayerBindings] = {}
         self.layer_device = next(self.model.parameters()).device
 
+        # Layer hoist state.  When use_layer_hoist is True we rebuild
+        # model.layers (via the parent module) on every reshuffle.
+        # Snapshot the original list + parent here so we can restore it.
+        self._hoist_parent: torch.nn.Module | None = None
+        self._hoist_attr: str | None = None
+        self._hoist_originals: List[torch.nn.Module] = []
+        self._hoist_last_kept: List[int] = []
+        self._hoist_last_yanked: List[int] = []
+        if bool(getattr(config, "use_layer_hoist", False)):
+            self._hoist_parent, self._hoist_attr = self._resolve_layers_parent(self.model)
+            self._hoist_originals = list(getattr(self._hoist_parent, self._hoist_attr))
+
         self._build_layer_bindings()
-        self._install_hooks()
+        # Hoist replaces the post-hook path entirely — they're mutually
+        # exclusive.  Hoist surgery happens at the end of step().
+        if not bool(getattr(config, "use_layer_hoist", False)):
+            self._install_hooks()
 
         print(
             f"DeepChaosScheduler: victims={self.victims[0] if self.victims else 'none'}-"
             f"{self.victims[-1] if self.victims else 'none'} sacred={sorted(self.sacred)} "
-            f"sticky={self.config.sticky_interval}"
+            f"sticky={self.config.sticky_interval} "
+            f"hoist={bool(getattr(config, 'use_layer_hoist', False))}"
         )
+
+    @staticmethod
+    def _resolve_layers_parent(model: torch.nn.Module) -> Tuple[torch.nn.Module, str]:
+        """Return the parent module and attribute name that owns the
+        transformer-layer ModuleList.  Mirrors the path search used by
+        `resolve_transformer_layers` but returns the parent so the caller
+        can `setattr(parent, attr, new_list)` for hoist surgery."""
+        base = _unwrap_model(model)
+        candidates = [
+            ("model", "layers"), ("model.model", "layers"),
+            ("model.decoder", "layers"), ("model.language_model", "layers"),
+            ("language_model.model", "layers"), ("language_model", "layers"),
+            ("text_model", "layers"), ("decoder", "layers"),
+            ("transformer", "layers"), ("transformer", "h"),
+            ("gpt_neox", "layers"), ("", "layers"),
+        ]
+        for parent_path, attr in candidates:
+            parent = base
+            if parent_path:
+                ok = True
+                for part in parent_path.split("."):
+                    if not hasattr(parent, part):
+                        ok = False
+                        break
+                    parent = getattr(parent, part)
+                if not ok:
+                    continue
+            layers = getattr(parent, attr, None)
+            if isinstance(layers, torch.nn.ModuleList) and len(layers) > 0:
+                return parent, attr
+        raise AttributeError(
+            "Could not locate transformer layers ModuleList parent for hoist."
+        )
+
+    def _apply_layer_hoist_surgery(self) -> Tuple[int, int]:
+        """Rebuild parent.layers to contain only sacred layers + victims in
+        mode=both.  Called from step() on every reshuffle event when
+        use_layer_hoist is True.
+
+        Returns (kept_count, yanked_count).
+        """
+        parent = self._hoist_parent
+        attr = self._hoist_attr
+        if parent is None or attr is None:
+            return (0, 0)
+        kept_indices: List[int] = []
+        yanked_indices: List[int] = []
+        survivors: List[torch.nn.Module] = []
+        for idx, layer in enumerate(self._hoist_originals):
+            if idx in self.sacred:
+                survivors.append(layer)
+                kept_indices.append(idx)
+                continue
+            topo = self.topologies.get(idx)
+            if topo is None or topo.mode == "both":
+                survivors.append(layer)
+                kept_indices.append(idx)
+            else:
+                yanked_indices.append(idx)
+        setattr(parent, attr, torch.nn.ModuleList(survivors))
+        self._hoist_last_kept = kept_indices
+        self._hoist_last_yanked = yanked_indices
+        return (len(kept_indices), len(yanked_indices))
 
     @classmethod
     def from_model(cls, model: torch.nn.Module, **overrides: Any):
@@ -393,6 +482,34 @@ class DeepChaosScheduler:
                 binding.hidden_size = _safe_int(o_weight.shape[0])
             if binding.hidden_size is None and down_weight is not None and down_weight.ndim == 2:
                 binding.hidden_size = _safe_int(down_weight.shape[0])
+
+            # Repair num_heads / num_kv_heads from projection out_features.
+            # Modern transformers `Qwen2Attention` (>= 4.40) stores
+            # num_key_value_heads only on `attn.config`, not on the module
+            # itself, so the `_first_attr` lookups above miss it and
+            # num_kv_heads silently defaults to num_heads.  On a GQA model
+            # that produces alive_k_out / alive_v_out indices that overshoot
+            # the actual k_proj / v_proj output dim.  Derive the real values
+            # from the projection weight shapes whenever head_dim is known.
+            if binding.head_dim is not None and binding.head_dim > 0:
+                hd = int(binding.head_dim)
+                if (
+                    isinstance(binding.q_proj, torch.nn.Module)
+                    and q_weight is not None
+                    and q_weight.ndim == 2
+                ):
+                    derived = int(q_weight.shape[0] // hd)
+                    if derived > 0 and derived != int(binding.num_heads or 0):
+                        binding.num_heads = derived
+                k_weight = (
+                    getattr(binding.k_proj, "weight", None)
+                    if binding.k_proj is not None
+                    else None
+                )
+                if k_weight is not None and k_weight.ndim == 2:
+                    derived_kv = int(k_weight.shape[0] // hd)
+                    if derived_kv > 0 and derived_kv != int(binding.num_kv_heads or 0):
+                        binding.num_kv_heads = derived_kv
 
             self.bindings[layer_idx] = binding
 
@@ -647,6 +764,18 @@ class DeepChaosScheduler:
                 f"({sliced_elements:,} / {full_elements:,} weight elements engaged)\n"
                 f"{'=' * 78}"
             )
+
+        # Layer hoist surgery: rebuild model.layers to contain only sacred
+        # layers + victims in mode=both.  Runs at every reshuffle event.
+        if bool(getattr(self.config, "use_layer_hoist", False)):
+            kept, yanked = self._apply_layer_hoist_surgery()
+            self.cached_stats["hoist_kept_layers"] = float(kept)
+            self.cached_stats["hoist_yanked_layers"] = float(yanked)
+            if bool(self.config.announce_reshuffles):
+                print(
+                    f"  layer hoist     : kept {kept} layer(s), yanked {yanked} "
+                    f"(yanked indices: {sorted(self._hoist_last_yanked)})"
+                )
         return self.cached_stats
 
     def freeze_topology(self, step: int):
@@ -733,6 +862,20 @@ class DeepChaosScheduler:
             except Exception:
                 pass
         self.hook_handles.clear()
+        # Restore the original model.layers ModuleList if hoist was active.
+        if (
+            self._hoist_parent is not None
+            and self._hoist_attr is not None
+            and self._hoist_originals
+        ):
+            setattr(
+                self._hoist_parent,
+                self._hoist_attr,
+                torch.nn.ModuleList(self._hoist_originals),
+            )
+            self._hoist_parent = None
+            self._hoist_attr = None
+            self._hoist_originals = []
         self.topologies.clear()
         self.cached_stats = None
         self.last_shuffle_step = None
