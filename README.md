@@ -1,6 +1,6 @@
 # deep-chaos-scheduler
 
-A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre/post training neural network diagnostic suite (BoL scans).
+A sticky-topology chaos scheduler for transformer fine-tuning on AMD MI300X (ROCm), paired with a pre/post training neural network diagnostic suite (BoL scans). Developed and benchmarked on AMD hardware — all training runs, evals, and speed numbers below are from MI300X / ROCm 7.2.
 
 ## Benchmark Results
 
@@ -22,12 +22,6 @@ The 3B MGSM result (+17pp over the 3B FFT) is the headline: same model, same dat
 **→ [Full evaluation breakdown: EVALUATIONS.md](EVALUATIONS.md)**
 
 ## Install
-
-### CUDA / generic
-
-```bash
-pip install git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
-```
 
 ### AMD MI300X / ROCm 7.2
 
@@ -112,6 +106,14 @@ Set the ROCm env vars before launching training (same as the DO droplet setup):
 export TORCH_BLAS_PREFER_HIPBLASLT=1
 export HIP_FORCE_DEV_KERNARG=1
 ```
+
+### Other platforms (CUDA / generic)
+
+```bash
+pip install git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
+```
+
+The scheduler is platform-agnostic — all AMD-specific speed settings and env vars are safe to omit on non-ROCm hardware.
 
 ### Dependencies
 
