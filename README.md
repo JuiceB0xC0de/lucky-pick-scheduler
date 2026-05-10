@@ -1,3 +1,20 @@
+<div align="center">
+
+[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
+[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red?style=flat-square&logo=pytorch)](https://pytorch.org/)
+[![Transformers](https://img.shields.io/badge/Transformers-4.30%2B-yellow?style=flat-square&logo=huggingface)](https://huggingface.co/docs/transformers/)
+[![TRL](https://img.shields.io/badge/TRL-%F0%9F%A4%97-blue?style=flat-square)](https://github.com/huggingface/trl)
+[![PEFT](https://img.shields.io/badge/PEFT-LoRA-green?style=flat-square)](https://github.com/huggingface/peft)
+[![Accelerate](https://img.shields.io/badge/Accelerate-Distributed%20Training-blueviolet?style=flat-square&logo=huggingface)](https://huggingface.co/docs/accelerate/)
+[![Weights & Biases](https://img.shields.io/badge/W%26B-Logging-orange?style=flat-square&logo=weightsandbiases)](https://wandb.ai/)
+
+[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
+[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square)](https://github.com/psf/black)
+[![AMD ROCm](https://img.shields.io/badge/AMD%20ROCm-7.2-EC1C1C?style=flat-square&logo=amd)](https://rocmdocs.amd.com/)
+[![CUDA Compatible](https://img.shields.io/badge/CUDA-Compatible-76B900?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
+
+</div>
+
 # deep-chaos-scheduler
 
 A sticky-topology chaos scheduler for transformer fine-tuning on AMD MI300X (ROCm), paired with a pre/post training neural network diagnostic suite (BoL scans). Developed and benchmarked on AMD hardware — all training runs, evals, and speed numbers below are from MI300X / ROCm 7.2.
