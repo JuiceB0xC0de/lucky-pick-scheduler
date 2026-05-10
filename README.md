@@ -1,19 +1,15 @@
-<div align="center">
-
-[![Python](https://img.shields.io/badge/Python-3.9%2B-blue?style=flat-square&logo=python)](https://www.python.org/)
-[![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-red?style=flat-square&logo=pytorch)](https://pytorch.org/)
-[![Transformers](https://img.shields.io/badge/Transformers-4.30%2B-yellow?style=flat-square&logo=huggingface)](https://huggingface.co/docs/transformers/)
-[![TRL](https://img.shields.io/badge/TRL-%F0%9F%A4%97-blue?style=flat-square)](https://github.com/huggingface/trl)
-[![PEFT](https://img.shields.io/badge/PEFT-LoRA-green?style=flat-square)](https://github.com/huggingface/peft)
-[![Accelerate](https://img.shields.io/badge/Accelerate-Distributed%20Training-blueviolet?style=flat-square&logo=huggingface)](https://huggingface.co/docs/accelerate/)
-[![Weights & Biases](https://img.shields.io/badge/W%26B-Logging-orange?style=flat-square&logo=weightsandbiases)](https://wandb.ai/)
-
-[![License: MIT](https://img.shields.io/badge/License-MIT-green.svg?style=flat-square)](LICENSE)
-[![Code style: black](https://img.shields.io/badge/code%20style-black-000000.svg?style=flat-square)](https://github.com/psf/black)
-[![AMD ROCm](https://img.shields.io/badge/AMD%20ROCm-7.2-EC1C1C?style=flat-square&logo=amd)](https://rocmdocs.amd.com/)
-[![CUDA Compatible](https://img.shields.io/badge/CUDA-Compatible-76B900?style=flat-square&logo=nvidia)](https://developer.nvidia.com/cuda-toolkit)
-
-</div>
+<p align="center">
+  <a href="https://pytorch.org/"><img src="https://img.shields.io/badge/PyTorch-2.0+-ee4c2c?logo=pytorch&logoColor=white" alt="PyTorch"></a>
+  <a href="https://huggingface.co/juiceb0xc0de"><img src="https://img.shields.io/badge/Hugging%20Face-Models-FFD700?logo=huggingface&logoColor=black" alt="Hugging Face"></a>
+  <a href="https://wandb.ai/ricks-holmberg-juiceb0xc0de/deep-chaos-evals?nw=nwuserricksholmberg"><img src="https://img.shields.io/badge/W%26B-Logging-FFBE00?logo=wandb&logoColor=black" alt="Weights and Biases"></a>
+  <a href="https://github.com/huggingface/transformers"><img src="https://img.shields.io/badge/Transformers-4.30+-yellow?logo=python&logoColor=gold" alt="Transformers"></a>
+  <a href="https://github.com/huggingface/trl"><img src="https://img.shields.io/badge/TRL-Integration-purple?logo=python&logoColor=white" alt="TRL"></a>
+  <a href="https://github.com/huggingface/peft"><img src="https://img.shields.io/badge/PEFT-LoRA-yellowgreen" alt="PEFT"></a>
+  <a href="https://github.com/huggingface/accelerate"><img src="https://img.shields.io/badge/Accelerate-Distributed-orange" alt="Accelerate"></a>
+  <a href="https://github.com/JuiceB0xC0de/deep-chaos-scheduler/blob/main/LICENSE"><img src="https://img.shields.io/badge/License-MIT-green" alt="License"></a>
+  <a href="https://rocmdocs.amd.com/en/latest/"><img src="https://img.shields.io/badge/ROCm-7.2-red?logo=amd&logoColor=white" alt="ROCm"></a>
+  <a href="https://developer.nvidia.com/cuda-toolkit"><img src="https://img.shields.io/badge/CUDA-Compatible-76B900?logo=nvidia&logoColor=white" alt="CUDA"></a>
+</p>
 
 # deep-chaos-scheduler
 
