@@ -13,22 +13,22 @@
 
 # deep-chaos-scheduler
 
-A sticky-topology chaos scheduler for transformer fine-tuning on AMD MI300X (ROCm), paired with a pre/post training neural network diagnostic suite (BoL scans). Developed and benchmarked on AMD hardware — all training runs, evals, and speed numbers below are from MI300X / ROCm 7.2.
+A sticky-topology chaos scheduler for transformer fine-tuning on AMD MI300X (ROCm), paired with a pre/post training neural network diagnostic suite (BoL scans). Developed and benchmarked on AMD hardware — every training run, eval, and speed number below comes from MI300X / ROCm 7.2.
 
 ## Layer Hoist — Kernel Optimizer
 
-The core performance story. The scheduler physically yanks dead and identity layers out of `model.layers` at every reshuffle boundary instead of running them and zeroing their output. The forward loop never sees them — no saved activations, no backward graph, no FLOPs.
+The core performance story. Instead of running dead and identity layers and zeroing their output, the scheduler physically yanks them out of `model.layers` at every reshuffle boundary. The forward loop never sees them — no saved activations, no backward graph, no FLOPs.
 
 **Measured on Qwen2.5-3B-Instruct, 5-epoch full training run, MI300X / ROCm 7.2:**
 
 | | Baseline (post-hook) | Layer Hoist |
 |---|---|---|
-| Wall-clock training time | baseline | **2.25× faster** |
+| Wall-clock training time | baseline | **2.25x faster** |
 | Peak VRAM | baseline | **18% less** |
 
 With ~30% of victim layers drawing `mode=both` (the only mode that runs full compute), roughly 70% of victim-layer compute disappears each sticky block. Layers in `dead`, `identity`, `attn-only`, or `mlp-only` modes cost nothing — they aren't in the graph.
 
-**Hoist is on by default** — you get the speedup unless you opt out:
+**Hoist is on by default:**
 
 ```python
 # default: hoist on, bias stub, sticky=50
@@ -40,9 +40,9 @@ DeepChaosConfig(sticky_interval=50, seed=42, use_layer_hoist=False)
 
 ## Benchmark Results
 
-Evaluated 8 fine-tuned Qwen2.5 checkpoints (4 × 7B, 4 × 3B) — one FFT baseline and three DeepChaos seeds per size — trained on [simplescaling/s1K](https://huggingface.co/datasets/simplescaling/s1K).
+Eight fine-tuned Qwen2.5 checkpoints (4 x 7B, 4 x 3B) — one FFT baseline and three DeepChaos seeds per size — trained on [simplescaling/s1K](https://huggingface.co/datasets/simplescaling/s1K).
 
-**DeepChaos wins on every reasoning benchmark except GSM8K strict-match** (a formatting artifact — the gap inverts on flexible-extract). Key numbers:
+DeepChaos wins on every reasoning benchmark except GSM8K strict-match (a formatting artifact — the gap inverts on flexible-extract). Headline numbers:
 
 | Benchmark | FFT-7B | Best DeepChaos-7B | FFT-3B | Best DeepChaos-3B |
 |---|---|---|---|---|
@@ -53,20 +53,20 @@ Evaluated 8 fine-tuned Qwen2.5 checkpoints (4 × 7B, 4 × 3B) — one FFT baseli
 | Minerva Prealgebra | 45.0% | **58.2%** (+13.2pp) | 33.6% | **41.8%** (+8.2pp) |
 | Hendrycks MATH-500 | 1.6% | 0.8% | 2.6% | **4.6%** (+2pp) |
 
-The 3B MGSM result (+17pp over the 3B FFT) is the headline: same model, same data, same compute — the topology lottery alone drives dramatically better generalization.
+The 3B MGSM result (+17pp over the 3B FFT) is the headline: same model, same data, same compute — the topology lottery alone drives the generalization gap.
 
 **→ [Full evaluation breakdown: EVALUATIONS.md](EVALUATIONS.md)**
 
-### Reproducing these numbers on your own MI300X
+### Reproducing on your own MI300X
 
-The eval driver is `eval_amd.py` — plain Python, runs lm-eval-harness through vLLM's ROCm backend on the MI300X directly. One MI300X (192GB VRAM) handles both 3B and 7B sweeps; models run sequentially.
+The eval driver is `eval_amd.py` — plain Python, runs lm-eval-harness through vLLM's ROCm backend on the MI300X directly. One MI300X (192 GB VRAM) handles both 3B and 7B sweeps; models run sequentially.
 
 ```bash
 # One-time eval-only deps on top of `bash setup_amd.sh`:
 pip install "lm_eval[math,vllm]>=0.4.4"
 pip install --pre vllm --index-url https://download.pytorch.org/whl/rocm6.2
 
-# Full sweep — 5 × 3B + 5 × 7B, ~6–8h on one MI300X:
+# Full sweep — 5 x 3B + 5 x 7B, ~6-8h on one MI300X:
 python eval_amd.py --all
 
 # Or pick a slice:
@@ -99,8 +99,7 @@ pip install --break-system-packages --no-deps --no-cache-dir \
     git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git
 ```
 
-`--no-deps` is critical on AMD — without it pip can helpfully reinstall a CUDA torch
-wheel and silently break your environment. To pull updates after setup:
+`--no-deps` is critical on AMD. Without it, pip will helpfully reinstall a CUDA torch wheel and silently break your environment. To pull updates after setup:
 
 ```bash
 cd deep-chaos-scheduler && git fetch origin && git reset --hard origin/main && \
@@ -114,17 +113,11 @@ export TORCH_BLAS_PREFER_HIPBLASLT=1
 export HIP_FORCE_DEV_KERNARG=1
 ```
 
-`TORCH_BLAS_PREFER_HIPBLASLT=1` tells the ROCm matmul dispatcher to prefer
-hipBLASLt over rocBLAS where it has a kernel. `HIP_FORCE_DEV_KERNARG=1` forces
-kernel arguments to live in device memory instead of being host-managed —
-both are small but free throughput gains on MI300X. Set them in the shell
-before launching python; setting them via `os.environ[...] = "1"` at the top
-of the script also works as long as it's before any torch import.
+`TORCH_BLAS_PREFER_HIPBLASLT=1` tells the ROCm matmul dispatcher to prefer hipBLASLt over rocBLAS where it has a kernel. `HIP_FORCE_DEV_KERNARG=1` forces kernel arguments into device memory instead of host-managed — both are small free throughput gains on MI300X. Set them in the shell before launching python; setting them via `os.environ[...] = "1"` at the top of the script also works as long as it's before any torch import.
 
 ### Local dev environment (venv, ROCm 6.2)
 
-For a local Linux rig with ROCm 6.2 where you want an isolated venv and a full
-Jupyter + W&B dev environment:
+For a local Linux rig with ROCm 6.2 where you want an isolated venv and a full Jupyter + W&B dev environment:
 
 ```bash
 # 1. Create and activate venv
@@ -159,7 +152,7 @@ wandb login
 jupyter notebook --no-browser --port=8888 --ip=0.0.0.0 --allow-root
 ```
 
-Set the ROCm env vars before launching training (same as the DO droplet setup):
+Same ROCm env vars before launching training:
 
 ```bash
 export TORCH_BLAS_PREFER_HIPBLASLT=1
@@ -184,34 +177,34 @@ The scheduler is platform-agnostic — all AMD-specific speed settings and env v
 
 The scheduler stays model-family agnostic through four design choices:
 
-1. **Layer auto-discovery**: uses structural inference (`resolve_transformer_layers`) instead of hardcoded model maps.
-2. **Projection-hook masking**: modifies projection outputs with hooks instead of replacing forward methods.
-3. **KV-share awareness**: detects shared K/V regimes and avoids invalid hook placements on shared pathways.
-4. **Post-proj norm awareness**: supports architectures where normalization and projection ordering differs from Llama-like defaults.
+1. **Layer auto-discovery** — uses structural inference (`resolve_transformer_layers`) instead of hardcoded model maps.
+2. **Projection-hook masking** — modifies projection outputs with hooks instead of replacing forward methods.
+3. **KV-share awareness** — detects shared K/V regimes and avoids invalid hook placements on shared pathways.
+4. **Post-proj norm awareness** — supports architectures where normalization and projection ordering differs from Llama-like defaults.
 
 ---
 
 ## How the Scheduler Works
 
-`DeepChaosScheduler` runs a **sticky-block topology lottery** across your model's transformer layers on every training step.
+`DeepChaosScheduler` runs a sticky-block topology lottery across the model's transformer layers on every training step.
 
 On each reshuffle (every `sticky_interval` steps), the scheduler:
 
-1. Walks the model and auto-detects the transformer layer stack — no config files required
-2. Marks the first two and last two layers as **sacred** (always active), everything in between is a **victim**
-3. Randomly decides how many victim layers are active this block (30–70% by default)
-4. Enforces streak limits — a layer can't stay dead more than `max_consecutive_off` blocks or stay on more than `max_consecutive_on` blocks in a row
-5. For each active layer, draws a mode: `both` (attn + MLP), `attn only`, `mlp only`, or `identity`
-6. Within each active layer, randomly drops groups of Q/K/V heads, MLP gate/up/down channels, and hidden-dim slices using `register_forward_hook` — the base model's forward pass runs completely untouched
-7. Holds that topology frozen for the next `sticky_interval` steps, then reshuffles
+1. Walks the model and auto-detects the transformer layer stack — no config files required.
+2. Marks the first two and last two layers as **sacred** (always active); everything in between is a **victim**.
+3. Randomly decides how many victim layers are active this block (30-70% by default).
+4. Enforces streak limits — a layer can't stay dead more than `max_consecutive_off` blocks or stay on more than `max_consecutive_on` blocks in a row.
+5. For each active layer, draws a mode: `both` (attn + MLP), `attn only`, `mlp only`, or `identity`.
+6. Within each active layer, randomly drops groups of Q/K/V heads, MLP gate/up/down channels, and hidden-dim slices using `register_forward_hook`. The base model's forward pass runs completely untouched.
+7. Holds that topology frozen for the next `sticky_interval` steps, then reshuffles.
 
-The result is that the model never trains through the same compute path twice for long. It can't over-rely on specific heads or MLP channels and has to build more distributed representations to stay consistent.
+The model never trains through the same compute path twice for long. It can't over-rely on specific heads or MLP channels and has to build distributed representations to stay consistent.
 
 ### Hook-based, not forward-replacement
 
-The scheduler installs `register_forward_hook` on individual projection modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). The base model's own forward — including its LayerNorms, RoPE, causal masking, sliding window, and any remote-code logic — runs exactly as written. The hooks only zero out non-surviving output indices after each projection fires.
+The scheduler installs `register_forward_hook` on individual projection modules (`q_proj`, `k_proj`, `v_proj`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`). The base model's own forward — LayerNorms, RoPE, causal masking, sliding window, any remote-code logic — runs exactly as written. The hooks only zero out non-surviving output indices after each projection fires.
 
-This means it works across model families (Llama, Gemma, Mistral, Qwen, Falcon, GPT-NeoX, etc.) without architecture-specific code.
+This is why it works across model families (Llama, Gemma, Mistral, Qwen, Falcon, GPT-NeoX, etc.) without architecture-specific code.
 
 ### Auto-detection
 
@@ -223,9 +216,9 @@ Sacred and victim ranges are computed from `num_hidden_layers`. If the model has
 
 ## Tested Models
 
-The scheduler auto-config path was tested across the following checkpoints:
+Auto-config tested across:
 
-| Model | Size / Type | Scheduler Auto-Config | Limitation / Caveat |
+| Model | Size / Type | Auto-Config | Limitation / Caveat |
 |---|---|---|---|
 | Qwen 2.5 3B Instruct | 3B | ✅ | None observed |
 | Falcon-E 3B Instruct | 3B | ✅ | Use `prequantized` revision for training |
@@ -234,16 +227,12 @@ The scheduler auto-config path was tested across the following checkpoints:
 | Doge-320M | 320M Tiny | ✅ | Remote-code revisions can require compat patching |
 | Llama 3.2 3B | 3B | ✅ | None observed |
 | Llama 3.2 3B Instruct (MI300X / ROCm 7.2) | 3B | ✅ | Use `attn_implementation="sdpa"` for training (41% faster); `eager` only for BoL attention scan. Set `pad_token_id=128001` explicitly. |
-| Gemma-4-E4B | ~4B (efficient) | ✅ | Text-only path may require `attn_implementation=\"eager\"` and explicit CUDA move |
+| Gemma-4-E4B | ~4B (efficient) | ✅ | Text-only path may require `attn_implementation="eager"` and explicit CUDA move |
 | Phi-4-mini-instruct | Mini | ✅ | Prefer native HF load (`trust_remote_code=False`) |
 | OLMo-2-0425-1B | 1B | ✅ | None observed |
 | Phi-tiny-MoE-instruct | Tiny MoE | ✅ | Prefer fp32 training precision for grouped MoE dtype consistency |
 
-## Compatibility & Limitations
-
-The scheduler was tested on the architectures above, and layer discovery / sacred-victim auto-configuration worked without manual layer mapping, including MoE models.
-
-No permanently unsupported model family is currently known, but highly custom remote-code checkpoints can still require model-specific loader flags.
+Layer discovery and sacred-victim auto-configuration worked across every architecture above without manual layer mapping, including MoE. No permanently unsupported model family is currently known, but highly custom remote-code checkpoints can still require model-specific loader flags.
 
 ---
 
@@ -330,7 +319,7 @@ dc = DeepChaosScheduler(
 
 ### freeze_topology
 
-If you need to lock the current topology in place (for a probe or eval mid-run):
+To lock the current topology in place (for a probe or eval mid-run):
 
 ```python
 dc.freeze_topology(global_step)
@@ -340,8 +329,7 @@ dc.freeze_topology(global_step)
 
 ## Using with TRL + plain transformers (recommended on AMD)
 
-This is the cleanest path on MI300X / ROCm 7.2 — no unsloth, no xformers, no
-CUDA-specific dependencies.
+Cleanest path on MI300X / ROCm 7.2 — no unsloth, no xformers, no CUDA-specific dependencies.
 
 ```python
 import torch
@@ -416,24 +404,13 @@ dc.remove()
 | `TORCH_BLAS_PREFER_HIPBLASLT=1` (env var) | Prefer hipBLASLt for matrix kernels. Set in shell before launching python. |
 | `packing=False` | Required without a real `flash_attn` package — see Known Pitfalls. |
 
-The DO ROCm 7.2 droplet has `triton==3.6.0`, `triton-rocm==3.6.0`, and the HIP
-flash-attn headers inside torch itself (`torch/include/ATen/native/transformers/hip/flash_attn`).
-There's no `flash_attn` pip package installed; getting one would require a
-20–40 minute build from source. Until that's done, SDPA via Triton is the fast path.
+The DO ROCm 7.2 droplet ships `triton==3.6.0`, `triton-rocm==3.6.0`, and the HIP flash-attn headers inside torch itself (`torch/include/ATen/native/transformers/hip/flash_attn`). There's no `flash_attn` pip package installed; getting one means a 20-40 minute build from source. Until that's done, SDPA via Triton is the fast path.
 
-If you specifically need BoL's `attention_map` scan (which requires
-`output_attentions=True`), switch to `attn_implementation="eager"` for that run
-only — SDPA on this stack silently returns `None` for attention weights. Use
-SDPA for training, eager for diagnostics.
+If you specifically need BoL's `attention_map` scan (which requires `output_attentions=True`), switch to `attn_implementation="eager"` for that run only — SDPA on this stack silently returns `None` for attention weights. SDPA for training, eager for diagnostics.
 
 ### AMD GPU telemetry (W&B logging via amdsmi)
 
-W&B's built-in system-metrics reader gives you almost nothing useful on AMD —
-no per-step gfx activity, no hipBLAS clocks, no throttle status. The fix is to
-read straight from `amdsmi` (ships with the ROCm install) inside a
-`TrainerCallback` and log the values yourself. The callback below is the one
-used to produce the Lucky Pick benchmark dashboard on Qwen2.5-3B-Instruct + s1K
-(MI300X, ROCm 7.2):
+W&B's built-in system-metrics reader gives you almost nothing useful on AMD — no per-step gfx activity, no hipBLAS clocks, no throttle status. The fix is to read straight from `amdsmi` (ships with the ROCm install) inside a `TrainerCallback` and log the values yourself. The callback below is the one used to produce the Lucky Pick benchmark dashboard on Qwen2.5-3B-Instruct + s1K (MI300X, ROCm 7.2):
 
 ```python
 import torch
@@ -517,15 +494,17 @@ class AMDTelemetryCallback(TrainerCallback):
 # trainer = SFTTrainer(..., callbacks=[AMDTelemetryCallback(), ChaosStepCallback()])
 ```
 
-Why each metric matters:
+What each metric tells you:
 
-- `gpu/gfx_util` and `gpu/mem_util` distinguish "compute-bound" from "memory-bound" — chaos runs land lower because much of the layer stack is dead each window. If chaos runs match dense gfx_util, the scheduler isn't actually saving compute.
-- `gpu/temp_hotspot_c` and `gpu/throttle_status` tell you whether observed slowdowns are algorithmic or thermal. A 70 °C hotspot with throttle_status=0 is a healthy MI300X.
-- `gpu/gfx_clk_mhz` vs `gpu/gfx_clk_max_mhz` shows whether the GPU is actually running at boost or being held back by power/thermal envelope.
+- `gpu/gfx_util` and `gpu/mem_util` — separates compute-bound from memory-bound. Chaos runs land lower because much of the layer stack is dead each window. If a chaos run matches dense gfx_util, the scheduler isn't actually saving compute.
+- `gpu/temp_hotspot_c` and `gpu/throttle_status` — distinguishes algorithmic slowdowns from thermal ones. 70 °C hotspot with `throttle_status=0` is a healthy MI300X.
+- `gpu/gfx_clk_mhz` vs `gpu/gfx_clk_max_mhz` — confirms the GPU is actually running at boost rather than being held back by the power/thermal envelope.
+
+### Using with Unsloth
 
 The scheduler works with Unsloth's `FastLanguageModel` — load your model normally, wrap it in the scheduler, then call `dc.step()` in a custom training loop or via a `TrainerCallback`.
 
-### Option 1 — Custom training loop
+#### Option 1 — Custom training loop
 
 ```python
 from unsloth import FastLanguageModel
@@ -565,7 +544,7 @@ dc.remove()
 
 `resolve_scheduler_model` unwraps PEFT/Unsloth wrappers so the hooks land on the actual transformer modules.
 
-### Option 2 — SFTTrainer via callback
+#### Option 2 — SFTTrainer via callback
 
 ```python
 from unsloth import FastLanguageModel
@@ -612,17 +591,17 @@ trainer = SFTTrainer(
 trainer.train()
 ```
 
-### Using with Axolotl or any other trainer
+### Axolotl or any other trainer
 
-The pattern is the same — load your model, initialize `DeepChaosScheduler`, plug in a callback or hook that calls `dc.step(global_step)` before each forward pass. The scheduler doesn't care how the model was loaded or what trainer wraps it.
+Same pattern: load your model, initialize `DeepChaosScheduler`, plug in a callback or hook that calls `dc.step(global_step)` before each forward pass. The scheduler doesn't care how the model was loaded or what trainer wraps it.
 
 ---
 
 ## Known Pitfalls
 
-- If you use `gradient_checkpointing=True`, keep `sticky_interval >= gradient_accumulation_steps`. If the topology reshuffles in the middle of an accumulation window, backward recomputation can see a different topology than forward, producing incorrect gradients.
+- **`gradient_checkpointing=True` interaction.** Keep `sticky_interval >= gradient_accumulation_steps`. If the topology reshuffles mid-accumulation window, backward recomputation can see a different topology than forward — incorrect gradients.
 
-- **`CUDA error: an illegal memory access` inside `clip_grad_norm_` on A100.** Traceback lands in `torch._foreach_norm(device_grads, norm_type)`, usually with `XID 31 ... MMU Fault ... FAULT_PDE ACCESS_TYPE_VIRT_READ` in the NVIDIA log. Not a NaN/Inf bug — grads are clean. The fused `_foreach_norm` kernel trips a PDE MMU fault on some A100 + CUDA 12.1 + PyTorch 2.5.1 combos (reproduced on Modal A100-80GB with Gemma-4 E4B). Fix by forcing the single-tensor loop:
+- **`CUDA error: an illegal memory access` inside `clip_grad_norm_` on A100.** Traceback lands in `torch._foreach_norm(device_grads, norm_type)`, usually with `XID 31 ... MMU Fault ... FAULT_PDE ACCESS_TYPE_VIRT_READ` in the NVIDIA log. Not a NaN/Inf bug — grads are clean. The fused `_foreach_norm` kernel trips a PDE MMU fault on some A100 + CUDA 12.1 + PyTorch 2.5.1 combos (reproduced on Modal A100-80GB with Gemma-4 E4B). Force the single-tensor loop:
 
   ```python
   from deep_chaos_scheduler import patch_clip_grad_norm_disable_foreach
@@ -632,23 +611,21 @@ The pattern is the same — load your model, initialize `DeepChaosScheduler`, pl
 
   Idempotent. Also patches the `accelerate.accelerator` reference that HF `Trainer` delegates to.
 
-- **Gemma-4 multimodal + `device_map="auto"` + extracting `.language_model`.** Gemma-4 (`Gemma3ForConditionalGeneration`) wraps `vision_tower`, `multi_modal_projector`, and `language_model`. `device_map="auto"` installs Accelerate `AlignDevicesHook` dispatch metadata on the parent wrapper's params; extracting `.language_model` for training leaves that stale metadata on the vision-side params. `Trainer` still iterates them via `model.parameters()`, and any foreach kernel over the full list PDE-faults. Load with `device_map=None`, drop the vision half, then `.to("cuda")` manually — `model_load_kwargs_for_training(model_name, dtype)` does this for you on Gemma-4 names.
+- **Gemma-4 multimodal + `device_map="auto"` + extracting `.language_model`.** Gemma-4 (`Gemma3ForConditionalGeneration`) wraps `vision_tower`, `multi_modal_projector`, and `language_model`. `device_map="auto"` installs Accelerate `AlignDevicesHook` dispatch metadata on the parent wrapper's params; extracting `.language_model` for training leaves stale metadata on the vision-side params. `Trainer` still iterates them via `model.parameters()`, and any foreach kernel over the full list PDE-faults. Load with `device_map=None`, drop the vision half, then `.to("cuda")` manually — `model_load_kwargs_for_training(model_name, dtype)` does this for you on Gemma-4 names.
 
-- **Debugging async CUDA faults.** The default async CUDA dispatcher surfaces errors at the next sync op, which may be far from the real faulting kernel. For any `illegal memory access` chase, set `CUDA_LAUNCH_BLOCKING=1` in the container env so the traceback points at the real line.
+- **Debugging async CUDA faults.** The default async CUDA dispatcher surfaces errors at the next sync op, which may be far from the real faulting kernel. Set `CUDA_LAUNCH_BLOCKING=1` in the container env so the traceback points at the real line.
 
 - **Modal image layer caches a stale scheduler SHA.** `modal.Image.run_commands(...)` hashes the command string for caching. If a pip-install-from-git refuses to update after you push a new SHA, bust the cache with an explicit token in the command string: `"echo 'lps-rev=<date>-<sha>' && pip install ... @<sha>"`. Bump the token whenever you push.
 
-- **AMD: pip silently swaps your ROCm torch for a CUDA one.** Default `pip install git+...` resolves the project's `install_requires`, sees `torch`, and helpfully installs the CUDA build on top of your ROCm wheels. Always use `--no-deps --no-cache-dir` on AMD environments (see Install section). To verify: `python -c "import torch; print(torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_name(0))"`. Expect `7.2`, `True`, `AMD Instinct MI300X VF`.
+- **AMD: pip silently swaps your ROCm torch for a CUDA one.** Default `pip install git+...` resolves the project's `install_requires`, sees `torch`, and helpfully installs the CUDA build on top of your ROCm wheels. Always use `--no-deps --no-cache-dir` on AMD environments (see Install). Verify with `python -c "import torch; print(torch.version.hip, torch.cuda.is_available(), torch.cuda.get_device_name(0))"`. Expect `7.2`, `True`, `AMD Instinct MI300X VF`.
 
-- **MI300X / ROCm 7.2: SDPA silently returns `None` for `output_attentions`.** `attn_implementation="sdpa"` is the fast path (41% epoch-time win on the DO droplet's Triton+HIP stack) but the ROCm SDPA kernel does not surface attention weights, so any code path that reads them — including BoL's `attention_map` scan — gets `None`. Use SDPA for training; switch to `attn_implementation="eager"` only when you want the attention scan to populate.
+- **MI300X / ROCm 7.2: SDPA silently returns `None` for `output_attentions`.** `attn_implementation="sdpa"` is the fast path (41% epoch-time win on the DO droplet's Triton+HIP stack), but the ROCm SDPA kernel does not surface attention weights — any code path that reads them, including BoL's `attention_map` scan, gets `None`. SDPA for training, `eager` only for the attention scan.
 
-- **MI300X / ROCm 7.2: `packing=True` is unsafe without a real `flash_attn` package.** The droplet has Triton-fused HIP attention via SDPA but no `flash_attn` wheel (it would need a 20–40 min source build). With packing enabled: `eager` OOMs around 22 GB on the packed-sequence softmax for 8 K context, and `sdpa` raises a warning and risks cross-example contamination because the masked-attention path needed for packing isn't fully implemented in the ROCm SDPA backend. Keep `packing=False` until a flash-attn build is ready. Estimated headroom once it's installed: another 15–25% on top of SDPA's gain.
+- **MI300X / ROCm 7.2: `packing=True` is unsafe without a real `flash_attn` package.** The droplet has Triton-fused HIP attention via SDPA but no `flash_attn` wheel (would need a 20-40 min source build). With packing enabled: `eager` OOMs around 22 GB on the packed-sequence softmax for 8 K context, and `sdpa` raises a warning and risks cross-example contamination because the masked-attention path needed for packing isn't fully implemented in the ROCm SDPA backend. Keep `packing=False` until a flash-attn build is ready. Estimated headroom once it's installed: another 15-25% on top of SDPA's gain.
 
 - **Llama-3 tokenizer warnings on Llama-3.2 / 3.3.** The default tokenizer has BOS/PAD/EOS overlap that triggers a noisy warning during training. Set `tokenizer.pad_token_id = 128001` (the EOT token) explicitly, and mirror it onto `model.config.pad_token_id` and `model.generation_config.pad_token_id`. Also null out `generation_config.temperature` / `top_p` / `do_sample` if you're not generating during training to silence the invalid-generation-flag warning.
 
 ---
-
-## Quantized / BitNet models
 
 ## Model-family compatibility helpers
 
@@ -673,14 +650,18 @@ model = AutoModelForCausalLM.from_pretrained(
 # Trainer(..., bf16=precision["bf16"], fp16=precision["fp16"])
 ```
 
-This includes:
+Covers:
 - Phi/Phi-MoE defaulting to native HF code path (`trust_remote_code=False`)
 - Phi-MoE fp32 precision recommendation to avoid grouped MoE dtype mismatch
 - Falcon-E prequantized revision and Mistral regex tokenizer compat
 
-### BitsAndBytes / GPTQ / AWQ (standard quantized)
+---
 
-If your checkpoint is quantized and the trainer rejects full-parameter training, `prepare_model_for_training` auto-attaches LoRA adapters:
+## Quantized models
+
+### BitsAndBytes / GPTQ / AWQ
+
+If a checkpoint is quantized and the trainer rejects full-parameter training, `prepare_model_for_training` auto-attaches LoRA adapters:
 
 ```python
 from deep_chaos_scheduler import ModelPrepConfig, prepare_model_for_training, resolve_scheduler_model
@@ -703,7 +684,7 @@ For non-quantized models, `prepare_model_for_training` is a no-op.
 
 ### Falcon-E and BitNet series (ternary weights)
 
-`tiiuae/Falcon-E-3B-Instruct` (and `Falcon-E-1B-Base`, `Falcon-E-7B-Base`, Microsoft's BitNet series) have three revisions:
+`tiiuae/Falcon-E-3B-Instruct` (and `Falcon-E-1B-Base`, `Falcon-E-7B-Base`, Microsoft's BitNet series) ship three revisions:
 
 | Revision | Use case |
 |---|---|
@@ -711,14 +692,14 @@ For non-quantized models, `prepare_model_for_training` is a no-op.
 | `prequantized` | Fine-tuning — bfloat16 weights, compatible with `onebitllms`. |
 | `bfloat16` | bfloat16 inference without BitNet kernels. |
 
-If you load the default revision and call any trainer, you'll get:
+Loading the default revision and calling any trainer:
 
 ```
 ValueError: The model you are trying to fine-tune is quantized with QuantizationMethod.BITNET
 but that quantization method do not support training.
 ```
 
-The correct path:
+Correct path:
 
 ```python
 import torch
@@ -736,8 +717,7 @@ model = AutoModelForCausalLM.from_pretrained(
 )
 
 # Replace standard linears with trainable BitLinear layers (onebitllms QAT).
-# This also auto-patches transformers' training validator so the Trainer
-# doesn't reject the model — no extra steps needed.
+# Auto-patches transformers' training validator so the Trainer doesn't reject the model.
 model = apply_bitnet_linear_replacement(model)
 
 dc = DeepChaosScheduler(model, DeepChaosConfig(sticky_interval=50))
@@ -754,7 +734,7 @@ quantize_to_1bit(output_dir, quantized_output_dir)
 
 Requires `pip install onebitllms`. LoRA/PEFT is not currently supported for BitNet models — `apply_bitnet_linear_replacement` does full-parameter QAT using a straight-through estimator.
 
-> **Container note:** `pip install git+https://...` in a container image is cached at build time. If you push changes to this repo and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git`
+> **Container note:** `pip install git+https://...` in a container image is cached at build time. If you push changes and the error persists, force a reinstall in your entrypoint: `pip install --force-reinstall --no-cache-dir git+https://github.com/JuiceB0xC0de/deep-chaos-scheduler.git`
 
 ---
 
@@ -798,27 +778,21 @@ print(report.to_dict())
 
 ## BoL Scans — Neural Network Pre/Post Diagnostics
 
-> If you've read this far and want to see what's actually happening inside the network during training, here's a bonus: BoL (Blocks of Life) runs a full diagnostic suite before and after fine-tuning and prints everything to your terminal. GPU required. Most people skip this section — it's here if you want it.
+Bonus: BoL (Blocks of Life) runs a full diagnostic suite before and after fine-tuning and prints everything to your terminal. GPU required. Skippable if you don't want it.
 
 ### The six scans
 
-**Weight Fingerprint**
-Per-layer, per-component weight statistics: mean, std, L2 norm, and sparsity for every projection group (q/k/v/o, gate/up/down). Gives you a direct before/after diff of what the optimizer actually changed.
+**Weight Fingerprint** — per-layer, per-component weight stats (mean, std, L2 norm, sparsity) for every projection group (q/k/v/o, gate/up/down). Direct before/after diff of what the optimizer actually changed.
 
-**Layer Sweep**
-Progressively zeroes out each layer and measures generation damage. Shows which layers carry the most load and which the model barely uses.
+**Layer Sweep** — progressively zeroes each layer and measures generation damage. Shows which layers carry the most load and which the model barely uses.
 
-**Component Ablation**
-Zeroes out one projection type at a time across the full model and measures the perplexity hit. Shows relative importance of each projection family.
+**Component Ablation** — zeroes one projection type at a time across the full model and measures the perplexity hit. Relative importance of each projection family.
 
-**Silhouette**
-Extracts hidden-state representations for related and unrelated word pairs, then computes a silhouette score measuring how well the model separates them. Closer to 1.0 = tighter clustering.
+**Silhouette** — extracts hidden-state representations for related and unrelated word pairs, then computes a silhouette score. Closer to 1.0 = tighter clustering.
 
-**CKA (Centered Kernel Alignment)**
-Computes pairwise representational similarity across all layers. Shows which layers have converged to similar representations and which are doing different things.
+**CKA (Centered Kernel Alignment)** — pairwise representational similarity across all layers. Shows which layers have converged and which are doing different things.
 
-**Attention Map**
-Per-head attention entropy and cross-token similarity for each layer. Low entropy = focused attention, high = diffuse.
+**Attention Map** — per-head attention entropy and cross-token similarity for each layer. Low entropy = focused attention, high = diffuse.
 
 ### Usage
 
@@ -850,9 +824,7 @@ trainer.train()
 post_results = run_all(model, tokenizer, phase="post", verbose=True)
 ```
 
-If you only want the compact one-liners (good for log scraping), use
-`print_summary=True` instead of `verbose=True`. The full render is also
-available as a string via `format_results_for_cli(results, phase=phase)`.
+For compact one-liners (good for log scraping), use `print_summary=True` instead of `verbose=True`. The full render is also available as a string via `format_results_for_cli(results, phase=phase)`.
 
 All six scans accept custom `eval_texts`, `probes`, `related_pairs`, `unrelated_pairs`, `cluster_words`, `clusters`, and `layer_stride` (skip layers for faster CKA on large models).
 
