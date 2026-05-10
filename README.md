@@ -28,10 +28,14 @@ The core performance story. The scheduler physically yanks dead and identity lay
 
 With ~30% of victim layers drawing `mode=both` (the only mode that runs full compute), roughly 70% of victim-layer compute disappears each sticky block. Layers in `dead`, `identity`, `attn-only`, or `mlp-only` modes cost nothing — they aren't in the graph.
 
-Enable with one config flag:
+**Hoist is on by default** — you get the speedup unless you opt out:
 
 ```python
-DeepChaosConfig(use_layer_hoist=True, sticky_interval=50, seed=42)
+# default: hoist on, bias stub, sticky=50
+DeepChaosConfig(sticky_interval=50, seed=42)
+
+# opt out for unusual architectures or hook-only debugging
+DeepChaosConfig(sticky_interval=50, seed=42, use_layer_hoist=False)
 ```
 
 ## Benchmark Results
@@ -279,6 +283,11 @@ DeepChaosConfig(
     # override auto-detected ranges if needed
     sacred_layers=None,         # e.g. [0, 1, 30, 31] for a 32-layer model
     victim_range=None,          # e.g. (2, 30) — end-exclusive
+
+    # layer hoist (the kernel optimizer — see top of README)
+    use_layer_hoist=True,       # physically yank dead/identity layers; default-on
+    hoist_stub_kind="bias",     # "bias" | "linear" | "none" — frozen perturbation per yanked run
+    hoist_stub_init_scale=0.01,
 
     announce_reshuffles=True,   # prints a line on each reshuffle
 )
@@ -837,8 +846,20 @@ deep-chaos-scheduler/
 │   ├── model_prep.py       # prepare_model_for_training, auto-LoRA for quantized checkpoints
 │   └── compat.py           # apply_transformers_remote_code_compat
 ├── bol_wandb/
-│   ├── callback.py         # BoLPrintCallback (TrainerCallback)
-│   └── scanner.py          # BOLScanner helper
+│   ├── callback.py         # BoLPrintCallback / BoLWandbCallback (TrainerCallback)
+│   ├── scanner.py          # BOLScanner helper
+│   └── metrics/            # ablation, attention, cka, fingerprint, silhouette
 ├── bol_scans.py            # run_all() — the six scans + W&B logging
+├── tests/                  # CPU-only smoke tests for the public API (pytest)
+├── train_benchmark.py      # canonical SFT training example (Qwen2.5-3B + DeepChaos)
+├── train_ab.py             # vanilla SFT vs DeepChaos hoist A/B harness
+├── eval_amd.py             # native MI300X / ROCm lm-eval driver (vLLM backend)
+├── bench/
+│   ├── bench_amd.py              # MI300X wall-clock + VRAM A/B (hoist vs baseline)
+│   ├── eval_modal.py             # Modal H100/L4 mirror of eval_amd.py (used during dev)
+│   ├── train_instrument.py       # 30-step instrumentation harness (AMD)
+│   └── train_instrument_modal.py # Modal H100/A100 mirror of the instrumentation harness
+├── EVALUATIONS.md          # full DeepChaos vs FFT eval breakdown across 7B and 3B
+├── setup_amd.sh            # one-shot MI300X / ROCm 7.2 environment setup
 └── setup.py
 ```

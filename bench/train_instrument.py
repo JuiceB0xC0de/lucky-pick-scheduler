@@ -1,6 +1,6 @@
 """Deep instrumentation harness for a hoist-enabled training run.
 
-Mirrors train_optimizer.py but caps at 30 steps with sticky_interval=25 so
+Mirrors train_benchmark.py but caps at 30 steps with sticky_interval=25 so
 we see two reshuffle boundaries (step 0 and step 25) and a full block in
 between.  Logs every event to /tmp/train_instrument.jsonl with
 nanosecond timestamps and a final summary table.
@@ -422,7 +422,7 @@ class InstrumentationCallback(TrainerCallback):
 
 
 # --------------------------------------------------------------------------- #
-#  SFT config — keep dataset constants identical to train_optimizer.py        #
+#  SFT config — keep dataset constants identical to train_benchmark.py        #
 # --------------------------------------------------------------------------- #
 
 

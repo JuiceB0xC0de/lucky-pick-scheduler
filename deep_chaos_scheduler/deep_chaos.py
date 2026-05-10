@@ -180,7 +180,11 @@ class DeepChaosConfig:
     #   3.55x faster wall-clock, 42.9% peak VRAM cut.
     # When True, the post-hook path is NOT installed — hoist is the only
     # mechanism modifying the forward.
-    use_layer_hoist: bool = False
+    # Default-on: you get the speedup unless you explicitly opt out with
+    # use_layer_hoist=False.  Opt out if your architecture has unusual
+    # layer parenting that _resolve_layers_parent can't trace, or if you
+    # want the safer hook-only path for debugging.
+    use_layer_hoist: bool = True
     # Hoist stub: tiny frozen perturbation inserted in place of contiguous
     # yanked runs.  Without it, removing dead/identity/attn/mlp layers
     # entirely makes adjacent surviving layers communicate directly when
