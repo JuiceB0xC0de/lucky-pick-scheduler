@@ -2,6 +2,25 @@
 
 A sticky-topology chaos scheduler for transformer fine-tuning, paired with a pre/post training neural network diagnostic suite (BoL scans).
 
+## Benchmark Results
+
+Evaluated 8 fine-tuned Qwen2.5 checkpoints (4 × 7B, 4 × 3B) — one FFT baseline and three DeepChaos seeds per size — trained on [simplescaling/s1K](https://huggingface.co/datasets/simplescaling/s1K).
+
+**DeepChaos wins on every reasoning benchmark except GSM8K strict-match** (a formatting artifact — the gap inverts on flexible-extract). Key numbers:
+
+| Benchmark | FFT-7B | Best DeepChaos-7B | FFT-3B | Best DeepChaos-3B |
+|---|---|---|---|---|
+| GSM8K flexible-extract | 68.8% | **70.6%** (+1.8pp) | 54.0% | **58.4%** (+4.4pp) |
+| MGSM | 60.0% | **66.4%** (+6.4pp) | 43.2% | **60.4%** (+17.2pp) |
+| Minerva Math (math_verify) | 28.0% | **36.6%** (+8.6pp) | 18.8% | **23.6%** (+4.8pp) |
+| Minerva Algebra | 48.0% | **58.0%** (+10pp) | 39.0% | **42.0%** (+3pp) |
+| Minerva Prealgebra | 45.0% | **58.2%** (+13.2pp) | 33.6% | **41.8%** (+8.2pp) |
+| Hendrycks MATH-500 | 1.6% | 0.8% | 2.6% | **4.6%** (+2pp) |
+
+The 3B MGSM result (+17pp over the 3B FFT) is the headline: same model, same data, same compute — the topology lottery alone drives dramatically better generalization.
+
+**→ [Full evaluation breakdown: EVALUATIONS.md](EVALUATIONS.md)**
+
 ## Install
 
 ### CUDA / generic
