@@ -57,6 +57,29 @@ The 3B MGSM result (+17pp over the 3B FFT) is the headline: same model, same dat
 
 **→ [Full evaluation breakdown: EVALUATIONS.md](EVALUATIONS.md)**
 
+### Reproducing these numbers on your own MI300X
+
+The eval driver is `eval_amd.py` — plain Python, runs lm-eval-harness through vLLM's ROCm backend on the MI300X directly. One MI300X (192GB VRAM) handles both 3B and 7B sweeps; models run sequentially.
+
+```bash
+# One-time eval-only deps on top of `bash setup_amd.sh`:
+pip install "lm_eval[math,vllm]>=0.4.4"
+pip install --pre vllm --index-url https://download.pytorch.org/whl/rocm6.2
+
+# Full sweep — 5 × 3B + 5 × 7B, ~6–8h on one MI300X:
+python eval_amd.py --all
+
+# Or pick a slice:
+python eval_amd.py --3b                                           # 3B sweep only
+python eval_amd.py --7b                                           # 7B sweep only
+python eval_amd.py --model juiceb0xc0de/benchmark-lucky-pick-19   # single model
+python eval_amd.py --model <id> --tasks gsm8k --limit 50          # smoke test
+```
+
+Default tasks: `gsm8k,minerva_math,hendrycks_math500,mgsm_direct_en`. Default limit: 500 examples per task. Results land in `./results/<run_name>/` and stream to W&B project `deep-chaos-evals` if `WANDB_API_KEY` is set.
+
+A Modal-driven mirror lives at `bench/eval_modal.py` (same lighteval CLI, wrapped for H100/L4 routing) — used during method development when local MI300X time was scarce. vLLM inference is deterministic across H100 and MI300X up to floating-point rounding well below task-score granularity, so the EVALUATIONS.md numbers reproduce on either path.
+
 ## Install
 
 ### AMD MI300X / ROCm 7.2
