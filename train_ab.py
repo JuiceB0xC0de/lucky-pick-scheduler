@@ -33,7 +33,7 @@ parser.add_argument("--mode", choices=["vanilla", "hoist"], required=True)
 args = parser.parse_args()
 
 SEED = 199
-MODEL_ID = "Qwen/Qwen2.5-1.5B-Instruct"
+MODEL_ID = "Qwen/Qwen2.5-3B-Instruct"
 set_seed(SEED)
 
 if torch.cuda.is_available():
@@ -56,8 +56,8 @@ except Exception as e:
 # ── wandb ────────────────────────────────────────────────────────────────────
 wandb.init(
     project="deep-chaos-ab",
-    name=f"{args.mode}-1.5b-s1k-{SEED}",
-    tags=[args.mode, "qwen2.5-1.5b", "s1k"],
+    name=f"{args.mode}-3b-s1k-{SEED}",
+    tags=[args.mode, "qwen2.5-3b", "s1k"],
     config={"mode": args.mode, "seed": SEED, "model": MODEL_ID},
 )
 

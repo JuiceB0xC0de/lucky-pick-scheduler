@@ -11,15 +11,15 @@ MODELS_3B = [
 ]
 
 MODELS_7B = [
-    "juiceb0xc0de/benchmark_luckypick_7b_667",
+    "juiceb0xc0de/benchmark-lucky-pick-7b-14",
+    "juiceb0xc0de/benchmark-luckypick-7b-667",
     "juiceb0xc0de/benchmark-luckypick-7b-555",
     "juiceb0xc0de/benchmark-luckypick-7b-19",
     "juiceb0xc0de/benchmark-fft-7b-19",
-    "Qwen/Qwen2.5-7B-Instruct",
 ]
 
-TASKS = "gsm8k,minerva_math,aime24,hendrycks_math500"
-WANDB_PROJECT = "lucky-pick-evals"
+TASKS = "gsm8k,minerva_math,hendrycks_math500,mgsm_direct_en"
+WANDB_PROJECT = "deep-chaos-evals"
 
 SECRETS = [
     modal.Secret.from_name("huggingface"),
@@ -60,10 +60,21 @@ VOLUMES = {
 
 def _run_eval(model_id: str, tasks: str = TASKS, limit: int = 500, tokenizer: str = ""):
     import subprocess, os
+    from huggingface_hub import snapshot_download
     run_name = model_id.split("/")[-1]
     tok = tokenizer or model_id
+    # vllm doesn't support subfolder arg — download checkpoint locally first
+    parts = model_id.split("/")
+    if len(parts) == 3:
+        local_path = snapshot_download(
+            repo_id="/".join(parts[:2]),
+            allow_patterns=f"{parts[2]}/*",
+        )
+        pretrained = os.path.join(local_path, parts[2])
+    else:
+        pretrained = model_id
     model_args = (
-        f"pretrained={model_id},"
+        f"pretrained={pretrained},"
         f"tokenizer={tok},"
         "dtype=bfloat16,"
         "gpu_memory_utilization=0.85,"
@@ -78,7 +89,7 @@ def _run_eval(model_id: str, tasks: str = TASKS, limit: int = 500, tokenizer: st
         "--tasks", tasks,
         "--limit", str(limit),
         "--batch_size", "auto",
-        "--gen_kwargs", "max_gen_toks=4096",
+        "--gen_kwargs", "max_gen_toks=1024",
         "--output_path", f"/tmp/results/{run_name}",
         "--log_samples",
         "--wandb_args", f"project={WANDB_PROJECT},name={run_name}",
@@ -88,7 +99,7 @@ def _run_eval(model_id: str, tasks: str = TASKS, limit: int = 500, tokenizer: st
 
 @app.function(
     image=eval_image,
-    gpu="A10G",
+    gpu="L4",
     timeout=7200,
     secrets=SECRETS,
     volumes=VOLUMES,
@@ -99,13 +110,29 @@ def eval_3b(model_id: str, tasks: str = TASKS, limit: int = 500):
 
 @app.function(
     image=eval_image,
-    gpu="A100-40GB",
+    gpu="H100",
     timeout=7200,
     secrets=SECRETS,
     volumes=VOLUMES,
 )
 def eval_7b(model_id: str, tasks: str = TASKS, limit: int = 500):
     _run_eval(model_id, tasks=tasks, limit=limit, tokenizer="Qwen/Qwen2.5-7B-Instruct")
+
+
+@app.function(image=eval_image, gpu="L4", timeout=120, secrets=SECRETS)
+def list_tasks():
+    from lm_eval.tasks import TaskManager
+    tm = TaskManager()
+    tasks = sorted(tm.all_tasks)
+    return "\n".join(tasks)
+
+
+@app.local_entrypoint()
+def show_tasks():
+    output = list_tasks.remote()
+    keywords = ["math", "gsm", "mgsm", "minerva", "hendrycks", "asdiv", "arith", "drop", "mmlu"]
+    matches = [l for l in output.splitlines() if any(k in l.lower() for k in keywords)]
+    print("\n".join(matches))
 
 
 @app.local_entrypoint()
