@@ -17,10 +17,6 @@ A sticky-topology chaos scheduler for transformer fine-tuning on AMD MI300X (ROC
 
 
 
-![AMD Hackathon](images/AMD-hackathon.png)
-
-
-
 ## Layer Hoist — Kernel Optimizer
 
 The core performance story. Instead of running dead and identity layers and zeroing their output, the scheduler physically yanks them out of `model.layers` at every reshuffle boundary. The forward loop never sees them — no saved activations, no backward graph, no FLOPs.
