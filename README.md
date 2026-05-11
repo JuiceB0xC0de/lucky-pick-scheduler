@@ -15,11 +15,6 @@
 
 A sticky-topology chaos scheduler for transformer fine-tuning on AMD MI300X (ROCm), paired with a pre/post training neural network diagnostic suite (BoL scans). Developed and benchmarked on AMD hardware — every training run, eval, and speed number below comes from MI300X / ROCm 7.2.
 
-
-<p align="center">
-  <a href="https://pytorch.org/">...badges...</a>
-</p>
-
 ![AMD Hackathon](images/AMD-hackathon.png)
 
 # deep-chaos-scheduler
